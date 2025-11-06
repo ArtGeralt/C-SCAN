@@ -1,6 +1,6 @@
 # Chemical Space and Cluster-Specific Analysis of Small ChEMBL Datasets
 
-> **Hello! This is my first GitHub project!** As a student diving into cheminformatics and computational chemistry, I've put together this tool to apply what I'm learning about molecular descriptors, clustering algorithms, and chemical space analysis. It's been an exciting journey combining chemistry knowledge with programming skills!
+> **Hello! This is my first GitHub project!** As a student diving into cheminformatics and computational chemistry, I've put together this tool to apply what I'm learning about molecular descriptors, clustering algorithms, and chemical space analysis.
 
 A comprehensive tool for analyzing chemical space and building cluster-specific models from small bioactivity datasets retrieved from ChEMBL. This project represents my exploration into the fascinating world of computational drug discovery, combining concepts from medicinal chemistry, machine learning, and data visualization.
 
@@ -34,19 +34,19 @@ This provides a complete pipeline from data collection to advanced analysis, all
 - **Interactive visualizations** including 2D/3D chemical space maps
 - **Activity landscape analysis** with structure-activity relationships
 
-### 🔬 Advanced Analytics
+### Advanced Analytics
 - **Subcluster analysis** for detailed chemical space decomposition
 - **Scaffold analysis** with Murcko scaffolds
 - **Property-activity correlations** with statistical validation
 - **Cluster-specific modeling** for improved predictions on small datasets
 
-### 🌐 Interactive Web Interface
+### Interactive Web Interface
 - **Streamlit-based GUI** with organized workflow tabs
 - **Real-time progress tracking** for all analysis steps
 - **Export capabilities** for results and visualizations
 - **Methodology explanations** integrated throughout the interface
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Installation
 
@@ -64,7 +64,7 @@ streamlit run app.py
 
 Navigate to `http://localhost:8501` in your web browser.
 
-## 📋 Usage Guide
+## Usage Guide
 
 ### 1. Data Collection
 - Enter a ChEMBL target ID (e.g., CHEMBL1936 for c-Kit)
@@ -86,7 +86,7 @@ Navigate to `http://localhost:8501` in your web browser.
 - Generate scaffold analysis and activity landscapes
 - Explore property-activity correlations
 
-## 🛠️ Technical Architecture
+## Technical Architecture
 
 ### Core Components
 
@@ -105,7 +105,7 @@ Navigate to `http://localhost:8501` in your web browser.
 - **Scikit-learn**: Machine learning and clustering algorithms
 - **Plotly/Matplotlib/Seaborn**: Visualization libraries
 
-## 📊 Example Analysis Workflow
+## Example Analysis Workflow
 
 1. **Data Retrieval**: Fetch c-Kit inhibitor data from ChEMBL
 2. **Descriptor Generation**: Calculate physicochemical and structural descriptors
@@ -201,4 +201,4 @@ A Student Project in Computational Chemistry and Cheminformatics
 
 ---
 
-**Note**: This is an educational project developed as part of my learning journey in computational chemistry. While the methods are based on established scientific principles, always validate results with appropriate experimental methods and consult relevant literature for research applications. I'm continuously learning and improving this tool - feedback is always welcome! 🎓
+**Note**: This is an educational project developed as part of my learning journey in computational chemistry. While the methods are based on established scientific principles, always validate results with appropriate experimental methods and consult relevant literature for research applications. I'm continuously learning and improving this tool - feedback is always welcome! 
