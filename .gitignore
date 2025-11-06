@@ -5,6 +5,10 @@ data/processed/*/
 *.png
 *.html
 
+# Private folders
+books/
+notes/
+
 # Python
 __pycache__/
 *.py[cod]
