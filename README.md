@@ -22,6 +22,7 @@ This provides a complete pipeline from data collection to advanced analysis, all
 - **Automated ChEMBL retrieval** with duplicate removal and data validation
 - **Flexible target selection** supporting various protein targets
 - **Comprehensive data preprocessing** with activity standardization (pIC50)
+- **Session state propagation**: loading a previous dataset instantly updates the active timestamp, sidebar badges, and all downstream default paths
 
 ### Molecular Characterization
 - **30+ molecular descriptors** across multiple categories (physicochemical, topological, electronic)
@@ -40,8 +41,38 @@ This provides a complete pipeline from data collection to advanced analysis, all
 - **Property-activity correlations** with statistical validation
 - **Cluster-specific modeling** for improved predictions on small datasets
 
+### QSAR Modeling (small_data_qsar.py)
+- **Auto-detection** of task (regression/classification) and target column from the loaded CSV
+- **Four algorithms**: PLS, SVM, Random Forest, XGBoost
+- **Rigorous validation**: LOOCV, Repeated K-Fold, Y-Randomization (20–200 trials)
+- **RFE feature selection** with configurable feature count
+- **Model comparison table** and publication-quality plots saved to `models/{timestamp}/`
+
+### Classification Pipeline (new page)
+End-to-end binary activity classifier workflow in three tabs:
+
+| Tab | What it does |
+|-----|-------------|
+| **1 · Prepare Data** | Merges IC50/Ki/Kd/Inhibition ChEMBL CSVs from `known_compounds/`, assigns binary activity labels, generates RDKit descriptors or Morgan fingerprints |
+| **2 · Train Classifiers** | Trains Random Forest and/or XGBoost classifiers; shows pre-flight `activity_class` column check; displays training plots using in-memory bytes (no token-expiry flicker) |
+| **3 · Screen Compounds** | Applies the trained model to a blind set, saves `all_predictions.csv`; auto-feeds results path to Predictive Extensions |
+
+### Predictive Extensions
+- **Applicability Domain (AD)**
+  - Tanimoto k-NN and hat-matrix leverage methods
+  - Robust CSV/TSV reader (`_sniff_csv`) handles tab-separated no-header files (e.g. raw SMILES lists) without crashing
+  - Pre-flight column inspector for both training and query files: shows numeric features, flags non-numeric/meta columns, raises a clear error when a raw SMILES file is given instead of a descriptor file
+  - Column-mismatch warning; AD uses only the shared feature subset
+  - Run button disabled until both files pass validation
+  - Training CSV auto-filled from session `descriptors_path`
+- **Conformal Prediction** — calibration-set wrapper for regression/classification models
+- **ADMET Scoring** — SwissADME / pkCSM API integration with composite ranking
+- **Multi-Task QSAR** — single model trained on multiple activity columns simultaneously
+
 ### Interactive Web Interface
-- **Streamlit-based GUI** with organized workflow tabs
+- **Streamlit-based GUI** with 7 sidebar pages and organized workflow tabs
+- **Live session status bar** — 4-column ✅/○ strip at the top of every page showing Data / Descriptors / Fingerprints / Clustered state
+- **Sidebar Active Session badges** — instantly reflect the currently loaded dataset
 - **Real-time progress tracking** for all analysis steps
 - **Export capabilities** for results and visualizations
 - **Methodology explanations** integrated throughout the interface
@@ -90,12 +121,19 @@ Navigate to `http://localhost:8501` in your web browser.
 
 ### Core Components
 
-- **`app.py`**: Main Streamlit application with multi-tab interface
+- **`app.py`**: Main Streamlit application — 7-page sidebar layout with live session state, status bar, and Active Session badges
 - **`data_collection.py`**: ChEMBL data retrieval and preprocessing
 - **`descriptors.py`**: Molecular descriptor calculation engine
 - **`fingerprints_clustering.py`**: Fingerprint generation and clustering
 - **`visualization.py`**: Comprehensive plotting and visualization suite
 - **`subcluster_analysis.py`**: Advanced cluster decomposition tools
+- **`small_data_qsar.py`**: Small-dataset QSAR with PLS/SVM/RF/XGBoost, LOOCV, Y-Randomization
+- **`classification_model.py`**: Binary activity classifier (RF/XGBoost) with `activity_class` target
+- **`prepare_and_train_classification.py`**: Data preparation pipeline for classification datasets
+- **`example_screen_blind_set.py`**: Blind-set screening with trained classifiers
+- **`predictive_extensions.py`**: Applicability Domain, Conformal Prediction, ADMET, Multi-Task QSAR
+- **`integrate_ml_docking.py`**: Consensus scoring combining ML predictions with docking scores
+- **`process_docking_csv.py`**: Docking result post-processing utilities
 
 ### Key Dependencies
 
@@ -136,28 +174,27 @@ This tool is specifically designed for scenarios where:
 - Correlation heatmaps and property distributions
 - Cluster analysis plots and dendrograms
 
+## Development Changelog
+
+### Session — March 2026
+- Added **Classification Pipeline** page (Prepare Data → Train Classifiers → Screen Compounds)
+- Added **QSAR Modeling** page with auto-detection of task/target from CSV, PLS/SVM/RF/XGBoost, LOOCV + Y-Randomization
+- Added **Predictive Extensions** page: Applicability Domain (Tanimoto/leverage), Conformal Prediction, ADMET Scoring, Multi-Task QSAR
+- Implemented **live session state**: `_init_session()`, `_session_status_bar()`, sidebar Active Session badges
+- Fixed **Applicability Domain** crash on tab-separated / no-header SMILES files via `_sniff_csv` + numeric-column pre-flight
+- Fixed **widget key caching** issues (`key=` removed from auto-detected QSAR selectors and Classification path inputs)
+- Fixed **image token expiry** in Classification Pipeline tab 2 — all `st.image()` calls now pass in-memory bytes
+- `classification_model.py`: changed silent `return None` to `raise ValueError` with actionable hint on missing `activity_class` column
+- Integrated `prepare_and_train_classification.py` and `example_screen_blind_set.py` as fully interactive GUI pages
+
 ## Future Development Plans
 
-As I continue my studies in computational chemistry and machine learning, I plan to expand this project with:
-
-### Machine Learning Enhancements
-- **QSAR Model Development**: Implementing regression and classification models for activity prediction
-- **Advanced Algorithms**: Exploring random forests, gradient boosting, and neural networks
-- **Model Validation**: Cross-validation strategies and performance metrics for chemical datasets
-- **Feature Selection**: Automated descriptor selection and importance ranking
-
-### Enhanced Analytics
-- **Predictive Modeling**: Compound activity prediction with confidence intervals
-- **Virtual Screening**: Tools for filtering large compound libraries
-- **ADMET Predictions**: Absorption, distribution, metabolism, excretion, and toxicity modeling
-- **Multi-target Analysis**: Simultaneous analysis of multiple biological targets
+As I continue my studies in computational chemistry, planned expansions include:
 
 ### Advanced Cheminformatics
 - **3D Molecular Descriptors**: Incorporating conformational and pharmacophore features
 - **Fragment-based Analysis**: Molecular fragment contributions to activity
 - **Similarity Searching**: Advanced similarity metrics and chemical space navigation
-
-This project serves as my foundation for understanding how computational methods can accelerate drug discovery processes!
 
 ## Contributing
 

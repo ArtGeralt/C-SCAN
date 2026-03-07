@@ -39,7 +39,8 @@ def safe_image_display(image_path, alt_text="No image available"):
     """Safely display an image, showing a message if the file doesn't exist"""
     if os.path.exists(image_path):
         try:
-            st.image(image_path)
+            with open(image_path, "rb") as _f:
+                st.image(_f.read())
         except Exception as e:
             st.error(f"Error displaying image: {str(e)}")
             st.info(alt_text)
@@ -113,40 +114,129 @@ def create_project_dirs(timestamp):
     return base_dir
 
 
+# ---------------------------------------------------------------------------
+# Session state helpers
+# ---------------------------------------------------------------------------
+
+def _init_session() -> None:
+    """Initialise session-state keys on first run so they always exist."""
+    defaults: dict = {
+        "active_timestamp": datetime.now().strftime("%Y%m%d"),
+        "_load_banner": None,
+        "data_path": None,
+        "descriptors_path": None,
+        "fingerprints_path": None,
+        "clustered_path": None,
+        "classification_model_dir": None,
+        "screening_results_path": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def _session_status_bar() -> None:
+    """Compact 4-column status strip shown at the top of every page."""
+    data = st.session_state.get("data_path")
+    desc = st.session_state.get("descriptors_path")
+    fp   = st.session_state.get("fingerprints_path")
+    clus = st.session_state.get("clustered_path")
+
+    def _badge(label: str, path, hint: str) -> None:
+        if path and os.path.exists(str(path)):
+            st.success(f"✅ **{label}**\n`{os.path.basename(str(path))}`")
+        else:
+            st.info(f"○ **{label}**\n{hint}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        _badge("Data", data, "→ Data Collection")
+    with c2:
+        _badge("Descriptors", desc, "→ Descriptors & Fingerprints")
+    with c3:
+        _badge("Fingerprints", fp, "→ Descriptors & Fingerprints")
+    with c4:
+        _badge("Clustered", clus, "→ Clustering & Visualization")
+    st.divider()
+
+
 # Sidebar components
 def sidebar_components():
+    _init_session()
     st.sidebar.title("KIT Inhibitor QSAR Explorer")
-    
-    # Project settings section
+
+    # ── Project settings ──────────────────────────────────────────────────
     st.sidebar.header("Project Settings")
-    
-    # Timestamp/project name
-    timestamp = st.sidebar.text_input("Project Timestamp/Name; Keep the same with an existing dataset", 
-                                    value=datetime.now().strftime("%Y%m%d"),
-                                    help="Unique identifier for this analysis run")
-    
+
+    # Timestamp: read from active_timestamp (free key, any page can write to it).
+    # Do NOT use key= here — that would bind the widget and block external writes.
+    timestamp = st.sidebar.text_input(
+        "Project Timestamp / Name",
+        value=st.session_state.get("active_timestamp", datetime.now().strftime("%Y%m%d")),
+        help=(
+            "Unique identifier for this analysis run. "
+            "Automatically updated when you load a previous dataset."
+        ),
+    )
+    # Mirror the widget value back so other pages can read the current project name.
+    st.session_state.active_timestamp = timestamp
+
     # Create a base directory for the project
     if timestamp:
         create_project_dirs(timestamp)
-    
-    # Target selection
+
+    # ── Target selection ──────────────────────────────────────────────────
     st.sidebar.subheader("ChEMBL Target")
-    chembl_id = st.sidebar.text_input("ChEMBL Target ID", 
-                                     value="CHEMBL1936",
-                                     help="ChEMBL ID for c-KIT/KIT kinase is CHEMBL1936")
-    
-    # Navigation
+    chembl_id = st.sidebar.text_input(
+        "ChEMBL Target ID",
+        value="CHEMBL1936",
+        help="ChEMBL ID for c-KIT/KIT kinase is CHEMBL1936",
+    )
+
+    # ── Navigation ────────────────────────────────────────────────────────
     st.sidebar.header("Navigation")
-    page = st.sidebar.radio("Go to", 
-                          ["Data Collection", "Descriptors & Fingerprints", 
-                           "Clustering & Visualization", "Advanced Analysis"])
-    
+    page = st.sidebar.radio(
+        "Go to",
+        [
+            "Data Collection",
+            "Descriptors & Fingerprints",
+            "Clustering & Visualization",
+            "Subcluster Analysis",
+            "QSAR Modeling",
+            "Classification Pipeline",
+            "Predictive Extensions",
+        ],
+    )
+
+    # ── Active session badge ───────────────────────────────────────────────
+    st.sidebar.divider()
+    st.sidebar.header("📂 Active Session")
+
+    def _sb(label: str, key: str) -> None:
+        path = st.session_state.get(key)
+        if path and os.path.exists(str(path)):
+            st.sidebar.success(f"✅ {label}")
+            st.sidebar.caption(os.path.basename(str(path)))
+        else:
+            st.sidebar.info(f"○ {label} — not loaded")
+
+    _sb("Data",         "data_path")
+    _sb("Descriptors",  "descriptors_path")
+    _sb("Fingerprints", "fingerprints_path")
+    _sb("Clustered",    "clustered_path")
+
     return timestamp, chembl_id, page
 
 # Data collection page
 def data_collection_page(timestamp, chembl_id):
     st.header("KIT Inhibitor Data Collection")
-    
+    _session_status_bar()
+
+    # Show banner from a previous load and immediately clear it
+    if st.session_state.get("_load_banner"):
+        st.success(st.session_state["_load_banner"])
+        st.session_state["_load_banner"] = None
+
     col1, col2 = st.columns([2, 1])
     
     with col1:
@@ -206,6 +296,7 @@ def data_collection_page(timestamp, chembl_id):
                                 # Store in session state
                                 st.session_state.processed_data = final_df
                                 st.session_state.data_path = output_path
+                                st.session_state.active_timestamp = timestamp  # keep sidebar in sync
                                 
                                 # Display statistics
                                 st.subheader("Dataset Statistics")
@@ -378,28 +469,26 @@ def data_collection_page(timestamp, chembl_id):
                             except Exception as e:
                                 st.warning(f"⚠️ Found clustered file but couldn't load it: {str(e)}")
                         
-                        # Show comprehensive loading summary
-                        st.subheader("📋 Loading Summary")
-                        st.write(f"**Successfully loaded:** {', '.join(loaded_components)}")
-                        
-                        # Show what's ready for analysis
-                        st.write("**Ready for:**")
-                        ready_for = []
-                        if 'descriptors_path' in st.session_state:
-                            ready_for.append("• Property analysis and correlation studies")
-                        if 'fingerprints_path' in st.session_state:
-                            ready_for.append("• Chemical similarity analysis and clustering")
-                        if 'clustered_path' in st.session_state:
-                            ready_for.append("• Advanced cluster analysis and subclustering")
-                        
-                        if ready_for:
-                            for item in ready_for:
-                                st.write(item)
-                        else:
-                            st.write("• Basic visualization and analysis")
-                        
                         # Update timestamp in session for consistency
                         st.session_state.current_timestamp = timestamp_from_path
+                        st.session_state.active_timestamp = timestamp_from_path  # update sidebar
+
+                        # Build banner message, then rerun so sidebar + status bar update immediately
+                        ready_items = []
+                        if st.session_state.get("descriptors_path"):
+                            ready_items.append("descriptors")
+                        if st.session_state.get("fingerprints_path"):
+                            ready_items.append("fingerprints")
+                        if st.session_state.get("clustered_path"):
+                            ready_items.append("clustered data")
+                        banner = (
+                            f"Dataset ({timestamp_from_path}) loaded: "
+                            f"{len(loaded_components)} components — "
+                            + ", ".join(loaded_components)
+                            + (f" | Also ready: {', '.join(ready_items)}" if ready_items else "")
+                        )
+                        st.session_state["_load_banner"] = banner
+                        st.rerun()
                         
                     except Exception as e:
                         st.error(f"Error loading dataset: {str(e)}")
@@ -411,7 +500,7 @@ def data_collection_page(timestamp, chembl_id):
 # Descriptors and fingerprints page
 def descriptors_fingerprints_page(timestamp):
     st.header("Molecular Descriptors & Fingerprints")
-    
+    _session_status_bar()
     # Check if we have data
     if 'data_path' not in st.session_state:
         st.warning("Please fetch or load data first from the Data Collection page")
@@ -534,7 +623,7 @@ def descriptors_fingerprints_page(timestamp):
 # Clustering and visualization page
 def clustering_visualization_page(timestamp):
     st.header("Clustering & Visualization")
-    
+    _session_status_bar()
     # Check for required data
     if 'data_path' not in st.session_state:
         st.warning("Please fetch or load data first from the Data Collection page")
@@ -976,18 +1065,18 @@ def clustering_visualization_page(timestamp):
             - **SAR Analysis**: Visualize structure-activity relationships
             """)
 
-# Advanced analysis page
+# Subcluster analysis page
 def advanced_analysis_page(timestamp):
-    st.header("Advanced Analysis")
-    
+    st.header("Subcluster Analysis")
+    _session_status_bar()
     # Check for required data
     if 'data_path' not in st.session_state:
         st.warning("Please fetch or load data first from the Data Collection page")
         return
     
     # Tabs for different advanced analyses
-    tab1, tab2, tab3 = st.tabs(["Subcluster Analysis", "QSAR Modeling", "Compound Prediction"])
-    
+    tab1, = st.tabs(["Subcluster Analysis"])
+
     # Tab 1: Subcluster Analysis
     with tab1:
         st.subheader("Subcluster Analysis")
@@ -1193,16 +1282,967 @@ def advanced_analysis_page(timestamp):
             st.write("3. Go to 'Clustering & Visualization' page")
             st.write("4. Use the 'Clustering' tab to perform clustering")
     
-    # Tab 2: QSAR Modeling placeholder
-    with tab2:
-        st.subheader("QSAR Modeling")
-        st.info("QSAR modeling functionality will be implemented in a future version")
-    
-    # Tab 3: Compound Prediction placeholder
-    with tab3:
-        st.subheader("Compound Prediction")
-        st.info("Compound prediction functionality will be implemented in a future version")
+
+# ---------------------------------------------------------------------------
+# QSAR Modeling page
+# ---------------------------------------------------------------------------
+def small_data_qsar_page(timestamp: str):
+    st.header("📊 QSAR Modeling")
+    _session_status_bar()
+    st.markdown(
+        "Train and rigorously validate QSAR models on small datasets ("
+        "< 200 compounds) using PLS, SVM, Random Forest, and XGBoost with "
+        "LOOCV, Repeated K-Fold, and Y-Randomization testing."
+    )
+
+    # ── Input dataset ──────────────────────────────────────────────────────
+    st.subheader("1. Input Dataset")
+    col1, col2 = st.columns(2)
+    with col1:
+        # ── Resolve CSV default: session state first, then filesystem scan ──
+        _session_desc = st.session_state.get("descriptors_path") or ""
+        _candidates = [
+            str(_session_desc),  # what's already loaded in this session
+            f"data/processed/{timestamp}/kit_descriptors_selected.csv",
+            f"data/processed/{timestamp}/kit_descriptors.csv",
+            f"data/processed/{timestamp}/chembl_classification_descriptors.csv",
+        ]
+        default_csv = next(
+            (p for p in _candidates if p and os.path.exists(p)),
+            f"data/processed/{timestamp}/kit_descriptors.csv",
+        )
+        csv_path = st.text_input(
+            "Path to CSV with descriptors + target column",
+            value=default_csv,
+            key="qsar_csv_path",
+            help=(
+                "Auto-filled from your session. "
+                "For regression use kit_descriptors.csv (target: pIC50); "
+                "for classification use chembl_classification_descriptors.csv "
+                "(target: activity_class). Run Descriptors & Fingerprints first."
+            ),
+        )
+        # Friendly hint about loaded / available files
+        if _session_desc and os.path.exists(str(_session_desc)):
+            st.caption(f"📌 Loaded from session: `{os.path.basename(str(_session_desc))}`")
+        else:
+            _found = [p for p in _candidates[1:] if os.path.exists(p)]
+            if _found:
+                st.caption("Found on disk: " + "  |  ".join(
+                    os.path.basename(p) for p in _found
+                ))
+            else:
+                st.warning(
+                    f"No descriptor CSV found for project **{timestamp}**. "
+                    "Run the **Descriptors & Fingerprints** page first."
+                )
+
+        # ── Auto-detect task and target from the CSV columns ──────────────
+        _detected_task = "regression"
+        _detected_target = "pIC50"
+        _csv_cols: list[str] = []
+        if os.path.exists(csv_path):
+            try:
+                _csv_cols = pd.read_csv(csv_path, nrows=0).columns.tolist()
+                if "activity_class" in _csv_cols:
+                    _detected_task = "classification"
+                    _detected_target = "activity_class"
+                elif "pIC50" in _csv_cols:
+                    _detected_task = "regression"
+                    _detected_target = "pIC50"
+                st.caption(
+                    f"🔍 Auto-detected: **{_detected_task}** · target `{_detected_target}`  "
+                    f"({len(_csv_cols)} columns total)"
+                )
+            except Exception:
+                pass
+
+        task = st.selectbox(
+            "Task",
+            ["regression", "classification"],
+            index=0 if _detected_task == "regression" else 1,
+            # no key= here: Streamlit widget-state cache would override index= above
+        )
+        # If the user manually changed task, allow a manual target override;
+        # otherwise keep the auto-detected target.
+        _default_target = _detected_target if task == _detected_task else (
+            "pIC50" if task == "regression" else "activity_class"
+        )
+        # Validate that the default target actually exists in the file
+        if _csv_cols and _default_target not in _csv_cols:
+            _fallback_targets = [c for c in _csv_cols
+                                  if c not in ["molecule_chembl_id", "canonical_smiles",
+                                               "Smiles", "SMILES"]]
+            _default_target = _fallback_targets[0] if _fallback_targets else _default_target
+            st.warning(
+                f"⚠️ Default target `{_detected_target}` not found in this file. "
+                f"Suggested: `{_default_target}`. Adjust if needed."
+            )
+        target_col = st.text_input("Target column name", value=_default_target)
+        # no key= here for same reason
+    with col2:
+        n_features = st.number_input("Features to select (RFE, 0 = auto)",
+                                      min_value=0, max_value=500, value=0)
+        optimize_svm = st.checkbox("Grid-search SVM hyperparameters", value=True)
+        y_rand_trials = st.slider("Y-Randomization trials", 20, 200, 100)
+        test_size = st.slider("Test set fraction", 0.1, 0.4, 0.2, 0.05)
+
+    output_dir = f"models/{timestamp}/small_data_{task}"
+
+    # ── Run ────────────────────────────────────────────────────────────────
+    if st.button("▶ Run QSAR Pipeline", type="primary"):
+        if not os.path.exists(csv_path):
+            st.error(f"File not found: {csv_path}")
+            return
+        try:
+            from small_data_qsar import SmallDataQSAR
+            with st.spinner("Running feature selection, model training, and validation…"):
+                qsar = SmallDataQSAR(
+                    task=task,
+                    n_features_to_select=int(n_features) if n_features > 0 else None,
+                    optimize_svm=optimize_svm,
+                    n_y_rand_trials=int(y_rand_trials),
+                )
+                results = qsar.fit_evaluate(
+                    csv_path, target_col=target_col,
+                    test_size=test_size, output_dir=output_dir
+                )
+            st.success(f"Pipeline complete – results saved to `{output_dir}`")
+
+            # ── Comparison table ──────────────────────────────────────────
+            st.subheader("Model Comparison")
+            cmp_path = os.path.join(output_dir, "model_comparison.csv")
+            if os.path.exists(cmp_path):
+                st.dataframe(pd.read_csv(cmp_path, index_col=0).round(3))
+
+            # ── Y-Randomization verdict ───────────────────────────────────
+            st.subheader("Y-Randomization Results")
+            for model_name, m in results.items():
+                yr = m.get("y_randomization", {})
+                passed = yr.get("passed", None)
+                icon = "✅" if passed else "⚠️"
+                st.write(f"{icon} **{model_name}**: {yr.get('verdict', 'N/A')}  "
+                         f"(true score: `{yr.get('true_score', float('nan')):.3f}`, "
+                         f"rand mean: `{yr.get('rand_mean', float('nan')):.3f}±"
+                         f"{yr.get('rand_std', float('nan')):.3f}`)")
+
+            # ── Plots ─────────────────────────────────────────────────────
+            st.subheader("Plots")
+            plot_files = sorted(glob.glob(os.path.join(output_dir, "*.png")))
+            if plot_files:
+                cols = st.columns(min(3, len(plot_files)))
+                for i, p in enumerate(plot_files):
+                    with cols[i % len(cols)]:
+                        with open(p, "rb") as _f:
+                            st.image(_f.read(), caption=os.path.basename(p), use_container_width=True)
+            else:
+                st.info("No plots generated yet.")
+
+        except Exception as exc:
+            st.error(f"Error: {exc}")
+
+    # ── Show existing results ──────────────────────────────────────────────
+    elif os.path.isdir(output_dir):
+        st.info(f"Showing results from previous run in `{output_dir}`")
+        cmp_path = os.path.join(output_dir, "model_comparison.csv")
+        if os.path.exists(cmp_path):
+            st.subheader("Model Comparison")
+            st.dataframe(pd.read_csv(cmp_path, index_col=0).round(3))
+        plots = sorted(glob.glob(os.path.join(output_dir, "*.png")))
+        if plots:
+            st.subheader("Plots")
+            cols = st.columns(min(3, len(plots)))
+            for i, p in enumerate(plots):
+                with cols[i % len(cols)]:
+                    with open(p, "rb") as _f:
+                        st.image(_f.read(), caption=os.path.basename(p), use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# Predictive Extensions page
+# ---------------------------------------------------------------------------
+def predictive_extensions_page(timestamp: str):
+    st.header("🔬 Predictive Extensions")
+    _session_status_bar()
+
+    ext_tab1, ext_tab2, ext_tab3, ext_tab4 = st.tabs([
+        "Applicability Domain",
+        "Conformal Prediction",
+        "ADMET Scoring",
+        "Multi-Task QSAR",
+    ])
+
+    # ── Tab 1 – Applicability Domain ──────────────────────────────────────
+    with ext_tab1:
+        st.subheader("Applicability Domain (AD) Filtering")
+        st.markdown(
+            "Filter virtual-screening hits to compounds that lie within the "
+            "chemical space covered by your training set, using Tanimoto "
+            "similarity (fingerprints) or hat-matrix leverage (descriptors)."
+        )
+
+        # ── helper: sniff sep, detect header, keep only numeric feature cols ──
+        _AD_META = ["molecule_chembl_id", "canonical_smiles", "Smiles", "SMILES",
+                    "pIC50", "activity_class", "Activity_Level",
+                    "IC50_pActivity", "Kd_pActivity", "Ki_pActivity", "Inhibition_percent"]
+
+        def _sniff_csv(path: str) -> pd.DataFrame:
+            """Read CSV/TSV robustly regardless of separator or missing header."""
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                first = fh.readline()
+            sep = "\t" if first.count("\t") > first.count(",") else ","
+            # Detect whether first row is a header (non-numeric dominant row)
+            parts = first.strip().split(sep)
+            has_header = not all(_p.replace(".", "").replace("-", "").replace("e", "").isdigit()
+                                 for _p in parts if _p)
+            return pd.read_csv(path, sep=sep, header=0 if has_header else None)
+
+        def _preview_csv(path: str, label: str) -> tuple[pd.DataFrame | None, list[str]]:
+            """Show column info and return (df, feature_cols) or (None, []) on error."""
+            if not os.path.exists(path):
+                st.warning(f"⚠️ {label}: file not found — `{path}`")
+                return None, []
+            try:
+                df = _sniff_csv(path)
+                num_cols = [c for c in df.columns
+                            if c not in _AD_META and pd.api.types.is_numeric_dtype(df[c])]
+                str_cols = [c for c in df.columns if c not in num_cols]
+                with st.expander(f"📋 {label} — {len(df)} rows, "
+                                 f"{len(num_cols)} numeric feature cols", expanded=False):
+                    c_a, c_b = st.columns(2)
+                    with c_a:
+                        st.markdown("**Numeric feature columns (used):**")
+                        st.code("\n".join(str(c) for c in num_cols[:20])
+                                + ("\n…" if len(num_cols) > 20 else ""))
+                    with c_b:
+                        st.markdown("**Non-numeric / meta columns (excluded):**")
+                        st.code("\n".join(str(c) for c in str_cols[:20])
+                                + ("\n…" if len(str_cols) > 20 else ""))
+                    st.dataframe(df.head(3))
+                if len(num_cols) == 0:
+                    st.error(
+                        f"❌ **{label}**: no numeric feature columns found.  \n"
+                        "This looks like a raw SMILES file. "
+                        "The AD training set must be a **descriptor CSV** "
+                        "(e.g. `chembl_classification_descriptors.csv` or `kit_descriptors_selected.csv`). "
+                        "The query set must also have the same feature columns."
+                    )
+                else:
+                    st.success(f"✅ **{label}**: {len(num_cols)} numeric features ready.")
+                return df, num_cols
+            except Exception as exc:
+                st.error(f"❌ {label}: could not read file — {exc}")
+                return None, []
+
+        def _load_X_from_df(df: pd.DataFrame, feat_cols: list[str]) -> np.ndarray:
+            arr = df[feat_cols].fillna(0).values.astype(float)
+            return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+        ad_method = st.selectbox("AD method", ["tanimoto", "leverage"])
+        ad_threshold = st.slider("Tanimoto threshold (tanimoto only)", 0.1, 0.9, 0.4, 0.05)
+        ad_k = st.number_input("k-NN (tanimoto only)", 1, 20, 5)
+
+        # ── Auto-fill training CSV from session state ──────────────────────
+        _ad_train_cands = [
+            st.session_state.get("descriptors_path") or "",
+            f"data/processed/{timestamp}/chembl_classification_descriptors.csv",
+            f"data/processed/{timestamp}/chembl_classification_fingerprints.csv",
+            f"data/processed/{timestamp}/kit_descriptors_selected.csv",
+            f"data/processed/{timestamp}/kit_descriptors.csv",
+        ]
+        _ad_train_default = next(
+            (p for p in _ad_train_cands if p and os.path.exists(str(p))),
+            f"data/processed/{timestamp}/chembl_classification_descriptors.csv",
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            train_csv = st.text_input(
+                "Training set CSV (descriptors / fingerprints)",
+                value=_ad_train_default,
+                key="ad_train",
+            )
+        with col2:
+            query_csv = st.text_input(
+                "Query / screening CSV (same feature columns)",
+                value=(
+                    st.session_state.get("screening_results_path")
+                    or f"predictions/{timestamp}/blind_screening/all_predictions.csv"
+                ),
+                key="ad_query",
+            )
+
+        # ── Pre-flight previews ────────────────────────────────────────────
+        tr_df, tr_feat = _preview_csv(train_csv,  "Training set")
+        q_df,  q_feat  = _preview_csv(query_csv,  "Query set")
+
+        # Warn about column mismatch
+        if tr_feat and q_feat:
+            common = [c for c in tr_feat if c in q_feat]
+            only_tr = [c for c in tr_feat if c not in q_feat]
+            only_q  = [c for c in q_feat  if c not in tr_feat]
+            if only_tr or only_q:
+                st.warning(
+                    f"⚠️ Column mismatch: **{len(common)}** shared, "
+                    f"{len(only_tr)} only in training, {len(only_q)} only in query.  \n"
+                    "AD will use only the shared columns."
+                )
+
+        _ad_ready = bool(tr_feat and q_feat and
+                         [c for c in tr_feat if c in q_feat])
+
+        if st.button("Run AD Analysis", key="run_ad", disabled=not _ad_ready):
+            try:
+                from predictive_extensions import ApplicabilityDomain
+
+                common_feat = [c for c in tr_feat if c in q_feat]
+                with st.spinner("Computing AD…"):
+                    X_tr = _load_X_from_df(tr_df, common_feat)   # type: ignore[arg-type]
+                    X_q  = _load_X_from_df(q_df,  common_feat)   # type: ignore[arg-type]
+                    ad = ApplicabilityDomain(method=ad_method,
+                                            threshold=float(ad_threshold), k=int(ad_k))
+                    ad.fit(X_tr)
+                    mask = ad.predict(X_q)
+
+                df_q = q_df.copy()                               # type: ignore[union-attr]
+                df_q["inside_AD"] = mask
+                inside_n  = int(mask.sum())
+                outside_n = int((~mask).sum())
+                st.success(f"AD computed – **{inside_n} inside** / {outside_n} outside  "
+                           f"({100*inside_n/len(mask):.1f}% coverage)")
+
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.metric("Inside AD", inside_n)
+                with col_b:
+                    st.metric("Outside AD", outside_n)
+
+                st.subheader("AD-filtered compounds (inside AD)")
+                st.dataframe(df_q[df_q["inside_AD"]].head(50))
+
+                out_csv = f"predictions/{timestamp}/ad_filtered.csv"
+                os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+                df_q.to_csv(out_csv, index=False)
+                st.info(f"Full results saved to `{out_csv}`")
+            except Exception as exc:
+                st.error(f"Error: {exc}")
+                import traceback; st.code(traceback.format_exc())
+
+    # ── Tab 2 – Conformal Prediction ──────────────────────────────────────
+    with ext_tab2:
+        st.subheader("Conformal Prediction Intervals")
+        st.markdown(
+            "Wrap any trained model with **Inductive Conformal Prediction** "
+            "to obtain statistically guaranteed prediction intervals (regression) "
+            "or prediction sets (classification)."
+        )
+        cp_model_dir = st.text_input(
+            "Trained model directory",
+            value=f"models/{timestamp}/small_data_regression",
+            key="cp_model_dir"
+        )
+        cp_model_type = st.selectbox("Model file prefix",
+                                     ["random_forest", "xgboost", "svm", "pls"],
+                                     key="cp_model_type")
+        cp_task = st.selectbox("Task", ["regression", "classification"], key="cp_task")
+        cp_alpha = st.slider("Significance level α (1-α = coverage)", 0.05, 0.3, 0.10, 0.01,
+                             key="cp_alpha")
+        cp_cal_csv = st.text_input(
+            "Calibration set CSV",
+            value=f"data/processed/{timestamp}/chembl_classification_descriptors.csv",
+            key="cp_cal"
+        )
+        cp_target = st.text_input("Target column",
+                                   value="pIC50" if cp_task == "regression" else "activity_class",
+                                   key="cp_target")
+        cp_query_csv = st.text_input("Query CSV", value="blind_set/blind_set.csv",
+                                     key="cp_query")
+
+        if st.button("Run Conformal Predictor", key="run_cp"):
+            model_path = os.path.join(cp_model_dir, f"{cp_model_type}_model.pkl")
+            if not os.path.exists(model_path):
+                st.error(f"Model not found: {model_path}"); return  # type: ignore[return-value]
+            for p in [cp_cal_csv, cp_query_csv]:
+                if not os.path.exists(p):
+                    st.error(f"File not found: {p}"); return  # type: ignore[return-value]
+            try:
+                from predictive_extensions import ConformalPredictor
+                _excl = ["molecule_chembl_id", "canonical_smiles", "Smiles",
+                         "pIC50", "activity_class", "Activity_Level"]
+
+                def load_Xy(path: str, tgt: str):
+                    df = pd.read_csv(path)
+                    feat_cols = [c for c in df.columns if c not in _excl and c != tgt]
+                    X = df[feat_cols].fillna(0).values.astype(float)
+                    y = df[tgt].values if tgt in df.columns else np.zeros(len(df))
+                    return X, y
+
+                with open(model_path, "rb") as fh:
+                    base_model = pickle.load(fh)
+
+                scaler_path = os.path.join(cp_model_dir, "scaler.pkl")
+                with open(scaler_path, "rb") as fh:
+                    scaler = pickle.load(fh)
+
+                with st.spinner("Calibrating conformal predictor…"):
+                    X_cal, y_cal = load_Xy(cp_cal_csv, cp_target)
+                    X_q,  _     = load_Xy(cp_query_csv, cp_target)
+
+                    if cp_task == "classification":
+                        from sklearn.preprocessing import LabelEncoder
+                        le = LabelEncoder()
+                        y_cal_enc = le.fit_transform(y_cal)
+                    else:
+                        y_cal_enc = y_cal.astype(float)  # type: ignore[assignment]
+
+                    X_cal_sc = scaler.transform(X_cal)
+                    X_q_sc   = scaler.transform(X_q)
+
+                    cp_obj = ConformalPredictor(base_model, task=cp_task, alpha=cp_alpha)
+                    cp_obj.calibrate(X_cal_sc, y_cal_enc)
+                    preds = cp_obj.predict(X_q_sc)
+
+                st.success("Conformal prediction complete!")
+                st.dataframe(preds.head(50))
+
+                out_csv = f"predictions/{timestamp}/conformal_predictions.csv"
+                os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+                preds.to_csv(out_csv, index=False)
+                st.info(f"Saved to `{out_csv}`")
+
+                if cp_task == "regression":
+                    fig, ax = plt.subplots(figsize=(8, 4))
+                    ax.hist(preds["interval_width"], bins=30, edgecolor="k", alpha=0.7)
+                    ax.set_xlabel("Prediction interval width")
+                    ax.set_ylabel("Count")
+                    ax.set_title(f"Conformal interval widths (α={cp_alpha})")
+                    st.pyplot(fig)
+                    plt.close(fig)
+            except Exception as exc:
+                st.error(f"Error: {exc}")
+
+    # ── Tab 3 – ADMET Scoring ─────────────────────────────────────────────
+    with ext_tab3:
+        st.subheader("ADMET Scoring & Multi-Objective Ranking")
+        st.markdown(
+            "Query **SwissADME** or **pkCSM** for ADMET properties, then combine "
+            "them with a QSAR activity score into a single composite ranking."
+        )
+
+        admet_source = st.radio("API source", ["SwissADME", "pkCSM"], horizontal=True)
+        admet_results_csv = st.text_input(
+            "CSV with SMILES + QSAR score column",
+            value=(
+                st.session_state.get("screening_results_path")
+                or f"predictions/{timestamp}/blind_screening/all_predictions.csv"
+            ),
+            key="admet_csv"
+        )
+        smiles_col_admet = st.text_input("SMILES column name", value="SMILES", key="admet_smiles_col")
+        qsar_col_admet   = st.text_input("QSAR score column", value="Prob_1", key="admet_qsar_col")
+        delay = st.slider("Delay between API calls (s)", 0.5, 5.0, 1.0, 0.5)
+
+        if st.button("Fetch ADMET Properties", key="run_admet"):
+            if not os.path.exists(admet_results_csv):
+                st.error(f"File not found: {admet_results_csv}"); return  # type: ignore[return-value]
+            try:
+                from predictive_extensions import AdmetFilter
+                df_in = pd.read_csv(admet_results_csv)
+                if smiles_col_admet not in df_in.columns:
+                    st.error(f"Column '{smiles_col_admet}' not found."); return  # type: ignore[return-value]
+                smiles_list = df_in[smiles_col_admet].dropna().tolist()
+                limit = st.session_state.get("admet_limit", 20)
+                smiles_list = smiles_list[:limit]
+
+                admet = AdmetFilter(request_delay=delay)
+                with st.spinner(f"Querying {admet_source} for {len(smiles_list)} compounds…"):
+                    if admet_source == "SwissADME":
+                        df_admet = admet.query_swissadme(smiles_list)
+                    else:
+                        df_admet = admet.query_pkcsm(smiles_list)
+
+                st.dataframe(df_admet.head(20))
+
+                # Merge with input and rank
+                df_merged = df_in.merge(df_admet, on=smiles_col_admet, how="left") if smiles_col_admet in df_admet.columns else df_admet
+
+                if qsar_col_admet in df_merged.columns:
+                    st.subheader("Multi-Objective Ranking")
+                    admet_extra = [c for c in df_admet.columns
+                                   if c != smiles_col_admet and c in df_merged.columns]
+                    ranked = admet.rank_compounds(
+                        df_merged, qsar_col=qsar_col_admet,
+                        admet_cols=admet_extra[:5] if admet_extra else None
+                    )
+                    st.dataframe(ranked[[smiles_col_admet, qsar_col_admet, "composite_score"]].head(20))
+                    out_csv = f"predictions/{timestamp}/admet_ranked.csv"
+                    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+                    ranked.to_csv(out_csv, index=False)
+                    st.info(f"Saved to `{out_csv}`")
+            except Exception as exc:
+                st.error(f"Error: {exc}")
+
+        st.caption(
+            "⚠️ ADMET queries use public APIs (SwissADME, pkCSM). "
+            "Limit batch size to avoid overwhelming servers. Default: first 20 compounds."
+        )
+        st.number_input("Max compounds to query", 1, 200, 20, key="admet_limit")
+
+    # ── Tab 4 – Multi-Task QSAR ───────────────────────────────────────────
+    with ext_tab4:
+        st.subheader("Multi-Task QSAR")
+        st.markdown(
+            "Train a single model simultaneously on **multiple activity targets**, "
+            "sharing structural representations to compensate for small per-target datasets."
+        )
+
+        mt_csv = st.text_input(
+            "CSV with descriptors + multiple target columns",
+            value=f"data/processed/{timestamp}/chembl_merged_all_data.csv",
+            key="mt_csv"
+        )
+        mt_task = st.selectbox("Task", ["regression", "classification"], key="mt_task")
+        mt_base = st.selectbox("Base model", ["rf", "xgb", "svm"], key="mt_base")
+        mt_targets_raw = st.text_input(
+            "Target columns (comma-separated)",
+            value="IC50_pActivity,Ki_pActivity,Kd_pActivity",
+            key="mt_targets"
+        )
+        mt_n_splits = st.slider("CV folds", 2, 10, 5, key="mt_cv")
+        mt_n_repeats = st.slider("CV repeats", 1, 5, 3, key="mt_rep")
+        mt_output = f"models/{timestamp}/multitask"
+
+        if st.button("Train Multi-Task Model", key="run_mt"):
+            if not os.path.exists(mt_csv):
+                st.error(f"File not found: {mt_csv}"); return  # type: ignore[return-value]
+            try:
+                from predictive_extensions import MultiTaskQSAR
+                target_cols = [t.strip() for t in mt_targets_raw.split(",") if t.strip()]
+                df_mt = pd.read_csv(mt_csv)
+                missing = [c for c in target_cols if c not in df_mt.columns]
+                if missing:
+                    st.error(f"Target columns not found: {missing}"); return  # type: ignore[return-value]
+
+                _excl = ["molecule_chembl_id", "canonical_smiles", "Smiles",
+                         "activity_class", "Activity_Level"] + target_cols
+                feat_cols = [c for c in df_mt.columns if c not in _excl]
+                X = df_mt[feat_cols].fillna(0).values.astype(float)
+                Y = df_mt[target_cols].fillna(0)
+
+                with st.spinner("Training multi-task model…"):
+                    mt_model = MultiTaskQSAR(task=mt_task, base_model=mt_base)
+                    mt_model.fit(X, Y, target_names=target_cols)
+
+                st.success(f"Multi-task model trained on {X.shape[0]} compounds, "
+                           f"{len(target_cols)} targets.")
+
+                with st.spinner("Cross-validating…"):
+                    cv_results = mt_model.cross_validate(
+                        X, Y, n_splits=mt_n_splits, n_repeats=mt_n_repeats
+                    )
+                st.subheader("Per-Target CV Results")
+                st.dataframe(cv_results.round(3))
+
+                mt_model.save(mt_output)
+                st.info(f"Model saved to `{mt_output}/multitask_model.pkl`")
+
+                # Bar chart of per-target performance
+                metric = "mean_r2" if mt_task == "regression" else "mean_f1_weighted"
+                if metric in cv_results.columns:
+                    fig, ax = plt.subplots(figsize=(max(6, len(target_cols)*1.5), 4))
+                    ax.bar(cv_results.index, cv_results[metric], alpha=0.8)
+                    ax.set_ylabel(metric)
+                    ax.set_title("Per-Target CV Performance")
+                    plt.xticks(rotation=20, ha="right")
+                    fig.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
+            except Exception as exc:
+                st.error(f"Error: {exc}")
         
+# ---------------------------------------------------------------------------
+# Classification Pipeline page
+# ---------------------------------------------------------------------------
+def classification_pipeline_page(timestamp: str) -> None:
+    st.header("🧬 Classification Pipeline")
+    _session_status_bar()
+    st.markdown(
+        "Prepare ChEMBL classification datasets, train binary activity classifiers "
+        "(RF / XGBoost), and screen a blind set. "
+        "Outputs feed directly into **Predictive Extensions** (AD, ADMET, Conformal)."
+    )
+
+    tab1, tab2, tab3 = st.tabs([
+        "1 · Prepare Data",
+        "2 · Train Classifiers",
+        "3 · Screen Compounds",
+    ])
+
+    # ── Tab 1 – Prepare classification dataset ────────────────────────────────
+    with tab1:
+        st.subheader("Prepare Classification Dataset")
+        st.markdown(
+            "Loads `known_compounds/*.csv`, merges IC50 / Ki / Kd / Inhibition "
+            "activity data, assigns binary activity classes, then generates "
+            "molecular descriptors or Morgan fingerprints."
+        )
+
+        kc_dir = "known_compounds"
+        required_files = {
+            "chembl_all_class.csv":  os.path.join(kc_dir, "chembl_all_class.csv"),
+            "chembl_IC50.csv":       os.path.join(kc_dir, "chembl_IC50.csv"),
+            "chembl_Ki.csv":         os.path.join(kc_dir, "chembl_Ki.csv"),
+            "chembl_Kd.csv":         os.path.join(kc_dir, "chembl_Kd.csv"),
+            "chembl_Inhibition.csv": os.path.join(kc_dir, "chembl_Inhibition.csv"),
+        }
+
+        col_status, col_cfg = st.columns(2)
+        with col_status:
+            st.markdown("**Required input files:**")
+            all_present = True
+            for fname, fpath in required_files.items():
+                if os.path.exists(fpath):
+                    st.success(f"✅ {fname}")
+                else:
+                    st.error(f"❌ {fname} — missing!")
+                    all_present = False
+        with col_cfg:
+            feature_type = st.radio(
+                "Feature type",
+                ["Descriptors (RDKit)", "Fingerprints (Morgan ECFP4)"],
+                key="cls_feature_type",
+            )
+            use_fp = feature_type.startswith("Fingerprints")
+
+        if not all_present:
+            st.warning(
+                "Some source files are missing from `known_compounds/`. "
+                "Ensure all ChEMBL CSV files are present before running."
+            )
+
+        # Show what already exists
+        out_merged = f"data/processed/{timestamp}/chembl_merged_all_data.csv"
+        out_desc   = f"data/processed/{timestamp}/chembl_classification_descriptors.csv"
+        out_fp_csv = f"data/processed/{timestamp}/chembl_classification_fingerprints.csv"
+        existing_out = []
+        for p in [out_merged, out_desc, out_fp_csv]:
+            if os.path.exists(p):
+                existing_out.append(f"✅ `{os.path.basename(p)}` ({os.path.getsize(p)//1024} KB)")
+        if existing_out:
+            st.info("**Already generated for** `" + timestamp + "`:  " + "  |  ".join(existing_out))
+
+        if st.button("▶ Prepare Classification Data", type="primary", key="run_cls_prep",
+                     disabled=not all_present):
+            try:
+                import prepare_and_train_classification as pat
+                pat.timestamp = timestamp  # point module at current project
+
+                with st.spinner("Loading and merging ChEMBL data…"):
+                    merged_df = pat.load_and_merge_data(kc_dir)
+                    _out_dir = f"data/processed/{timestamp}"
+                    os.makedirs(_out_dir, exist_ok=True)
+                    merged_df.to_csv(out_merged, index=False)
+
+                st.success(f"✅ Merged **{len(merged_df)}** compounds → `{out_merged}`")
+                cls_dist = merged_df["activity_class"].value_counts().to_dict()
+                st.write("**Activity class distribution:**", cls_dist)
+
+                with st.spinner("Generating features (this may take a few minutes)…"):
+                    if use_fp:
+                        final_df = pat.generate_fingerprints(merged_df)
+                        out_path = out_fp_csv
+                    else:
+                        final_df = pat.generate_molecular_descriptors(merged_df)
+                        out_path = out_desc
+
+                    if "Smiles" in final_df.columns:
+                        final_df.rename(columns={"Smiles": "canonical_smiles"}, inplace=True)
+                    final_df.to_csv(out_path, index=False)
+
+                feat_cols = [
+                    c for c in final_df.columns
+                    if c not in ["canonical_smiles", "molecule_chembl_id", "activity_class"]
+                    and not ("IC50" in c or "Kd" in c or "Ki" in c or "Inhibition" in c)
+                ]
+                st.success(
+                    f"✅ Saved **{len(final_df)}** compounds × **{len(feat_cols)}** features → `{out_path}`"
+                )
+
+                st.session_state.descriptors_path = out_path
+                st.session_state["_load_banner"] = (
+                    f"Classification data prepared ({timestamp}): "
+                    f"{len(final_df)} compounds, {len(feat_cols)} features"
+                )
+                st.rerun()
+
+            except Exception as exc:
+                st.error(f"Error: {exc}")
+                import traceback; st.code(traceback.format_exc())
+
+    # ── Tab 2 – Train classifiers ─────────────────────────────────────────────
+    with tab2:
+        st.subheader("Train Classification Models")
+
+        # Candidate list: classification-specific filenames first (they always have
+        # activity_class), then fall back to session descriptors_path only if it
+        # actually contains the activity_class column.
+        _sess_desc = st.session_state.get("descriptors_path") or ""
+        _cls_specific = [
+            f"data/processed/{timestamp}/chembl_classification_descriptors.csv",
+            f"data/processed/{timestamp}/chembl_classification_fingerprints.csv",
+        ]
+        # Accept session path only when it contains activity_class
+        def _has_activity_class(p: str) -> bool:
+            try:
+                return "activity_class" in pd.read_csv(p, nrows=0).columns.tolist()
+            except Exception:
+                return False
+
+        _cls_cands = [p for p in _cls_specific if os.path.exists(p)]
+        if _sess_desc and os.path.exists(str(_sess_desc)) and _has_activity_class(str(_sess_desc)):
+            _cls_cands.insert(0, str(_sess_desc))
+
+        _cls_default = (
+            _cls_cands[0]
+            if _cls_cands
+            else f"data/processed/{timestamp}/chembl_classification_descriptors.csv"
+        )
+        cls_data_path = st.text_input(
+            "Prepared dataset (CSV with descriptors or fingerprints)",
+            value=_cls_default,
+            # no key= — widget-state cache would lock in the old regression path
+        )
+        if _cls_cands:
+            st.caption(f"📌 Auto-selected: `{os.path.basename(_cls_default)}`")
+
+        # Pre-flight: verify the file actually contains activity_class
+        if os.path.exists(cls_data_path):
+            try:
+                _cls_cols = pd.read_csv(cls_data_path, nrows=0).columns.tolist()
+                if "activity_class" in _cls_cols:
+                    st.success("✅ `activity_class` column found — file is ready for classification training.")
+                elif "pIC50" in _cls_cols and "activity_class" not in _cls_cols:
+                    st.error(
+                        "❌ This file contains `pIC50` (regression) but no `activity_class` column.  \n"
+                        "Run **Tab 1 · Prepare Data** first to generate a classification dataset "
+                        "(`chembl_classification_descriptors.csv`)."
+                    )
+            except Exception:
+                pass
+
+        col1, col2 = st.columns(2)
+        with col1:
+            train_rf  = st.checkbox("Random Forest", value=True,  key="cls_train_rf")
+            train_xgb = st.checkbox("XGBoost",       value=True,  key="cls_train_xgb")
+        with col2:
+            cls_optimize = st.checkbox(
+                "Hyperparameter optimisation (slower)", value=False, key="cls_optimize"
+            )
+
+        model_out_dir = f"models/{timestamp}/classification"
+        existing_models = sorted(glob.glob(f"{model_out_dir}/*.pkl"))
+        if existing_models:
+            st.info(
+                f"**Existing models in** `{model_out_dir}`:  "
+                + "  |  ".join(os.path.basename(f) for f in existing_models)
+            )
+
+        if st.button("▶ Train Classifiers", type="primary", key="run_cls_train"):
+            if not os.path.exists(cls_data_path):
+                st.error(f"Data file not found: {cls_data_path}")
+            elif not (train_rf or train_xgb):
+                st.warning("Select at least one model type.")
+            else:
+                try:
+                    from classification_model import build_classification_model
+                    os.makedirs(model_out_dir, exist_ok=True)
+                    trained: dict = {}
+
+                    for model_key, should_train, label in [
+                        ("rf",  train_rf,  "Random Forest"),
+                        ("xgb", train_xgb, "XGBoost"),
+                    ]:
+                        if not should_train:
+                            continue
+                        with st.spinner(f"Training {label}…"):
+                            try:
+                                _m, _s, _e, metrics = build_classification_model(
+                                    cls_data_path,
+                                    activity_column="activity_class",
+                                    model_type=model_key,
+                                    optimize=cls_optimize,
+                                    output_dir=model_out_dir,
+                                )
+                                if metrics:
+                                    trained[label] = metrics
+                                    st.success(f"✅ {label} trained")
+                            except Exception as exc:
+                                st.error(f"Error training {label}: {exc}")
+
+                    if trained:
+                        st.subheader("Model Comparison")
+                        cmp_df = pd.DataFrame(trained).T.round(3)
+                        st.dataframe(cmp_df)
+                        cmp_df.to_csv(f"{model_out_dir}/model_comparison.csv")
+
+                        plots = sorted(glob.glob(f"{model_out_dir}/*.png"))
+                        if plots:
+                            st.subheader("Training Plots")
+                            _pc = st.columns(min(3, len(plots)))
+                            for i, p in enumerate(plots):
+                                with _pc[i % len(_pc)]:
+                                    with open(p, "rb") as _f:
+                                        st.image(_f.read(), caption=os.path.basename(p),
+                                                 use_container_width=True)
+
+                        st.session_state["classification_model_dir"] = model_out_dir
+                        # Don't st.rerun() here — images would expire before the
+                        # new render fetches them. Session state is already updated;
+                        # sidebar badge refreshes on next user interaction.
+                        st.info(f"Models saved to `{model_out_dir}`. "
+                                "Navigate to **Screen Compounds** tab to screen a blind set.")
+
+                except Exception as exc:
+                    st.error(f"Error: {exc}")
+                    import traceback; st.code(traceback.format_exc())
+
+    # ── Tab 3 – Screen blind set ───────────────────────────────────────────────
+    with tab3:
+        st.subheader("Screen Blind Set")
+        st.markdown(
+            "Load a trained classifier and screen a compound library. "
+            "The output `all_predictions.csv` feeds directly into "
+            "**Predictive Extensions → ADMET Scoring** and **Applicability Domain**."
+        )
+
+        _default_model_dir = (
+            st.session_state.get("classification_model_dir")
+            or f"models/{timestamp}/classification"
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            screen_model_dir = st.text_input(
+                "Model directory",
+                value=_default_model_dir,
+                key="screen_model_dir",
+            )
+            _pkl_files = sorted(glob.glob(f"{screen_model_dir}/*.pkl")) \
+                if os.path.isdir(screen_model_dir) else []
+            _model_opts = [
+                os.path.basename(f).replace("_classifier.pkl", "").replace("_model.pkl", "")
+                for f in _pkl_files
+            ] or ["xgb", "rf"]
+            screen_model_type = st.selectbox(
+                "Model type", _model_opts, key="screen_model_type"
+            )
+
+        with col2:
+            screen_blind_file = st.text_input(
+                "Blind set file (CSV with SMILES column)",
+                value=st.session_state.get("data_path") or "blind_set/blind_set.csv",
+                key="screen_blind_file",
+            )
+            screen_target_class = st.text_input(
+                "Target class label (active compounds)",
+                value="1",
+                key="screen_target_cls",
+                help="Use '1' for active, '0' for inactive. "
+                     "Match the class labels in your training data.",
+            )
+            screen_confidence = st.slider(
+                "Confidence threshold",
+                0.5, 0.95, 0.7, 0.05,
+                key="screen_conf",
+            )
+
+        screen_out_dir = f"predictions/{timestamp}/blind_screening"
+        st.caption(f"Results saved to: `{screen_out_dir}/all_predictions.csv`")
+
+        # Show existing results if any
+        _existing_res = f"{screen_out_dir}/all_predictions.csv"
+        if os.path.exists(_existing_res):
+            try:
+                _prev = pd.read_csv(_existing_res)
+                st.info(
+                    f"ℹ️ Previous run: **{len(_prev)}** compounds in "
+                    f"`{_existing_res}` — run again to overwrite."
+                )
+            except Exception:
+                pass
+
+        if st.button("▶ Screen Compounds", type="primary", key="run_screen"):
+            if not os.path.isdir(screen_model_dir):
+                st.error(f"Model directory not found: {screen_model_dir}")
+            elif not os.path.exists(screen_blind_file):
+                st.error(f"Blind set file not found: {screen_blind_file}")
+            else:
+                try:
+                    from classification_prediction_tool import load_classifier
+
+                    with st.spinner(f"Loading `{screen_model_type}` classifier…"):
+                        classifier = load_classifier(
+                            screen_model_dir, model_type=screen_model_type
+                        )
+                    st.success("✅ Classifier loaded")
+
+                    os.makedirs(screen_out_dir, exist_ok=True)
+
+                    with st.spinner(
+                        f"Screening `{os.path.basename(screen_blind_file)}`…"
+                    ):
+                        results = classifier.screen_blind_set(
+                            screen_blind_file,
+                            output_dir=screen_out_dir,
+                            target_class=str(screen_target_class),
+                            confidence_threshold=screen_confidence,
+                        )
+
+                    if results is not None:
+                        prob_col = f"Prob_{screen_target_class}"
+                        high_conf_mask = results.get(
+                            "High_Confidence",
+                            pd.Series([False] * len(results))
+                        )
+                        n_hits = int(high_conf_mask.sum())
+
+                        col_a, col_b, col_c = st.columns(3)
+                        with col_a: st.metric("Total screened", len(results))
+                        with col_b: st.metric("High-confidence hits", n_hits)
+                        with col_c:
+                            if prob_col in results.columns:
+                                st.metric(
+                                    "Mean probability",
+                                    f"{results[prob_col].mean():.3f}"
+                                )
+
+                        st.subheader("Top 20 Hits")
+                        _disp = [c for c in
+                                 ["SMILES", "compound_id", "Predicted_Class",
+                                  prob_col, "High_Confidence"]
+                                 if c in results.columns]
+                        st.dataframe(results[_disp].head(20))
+
+                        with open(_existing_res, "rb") as fh:
+                            st.download_button(
+                                "⬇ Download all_predictions.csv",
+                                fh, "all_predictions.csv", "text/csv",
+                            )
+
+                        st.session_state["screening_results_path"] = _existing_res
+                        st.session_state["_load_banner"] = (
+                            f"Screening complete: {len(results)} compounds, "
+                            f"{n_hits} hits → `{_existing_res}`"
+                        )
+                        st.rerun()
+                    else:
+                        st.error("Screening returned no results.")
+
+                except Exception as exc:
+                    st.error(f"Error: {exc}")
+                    import traceback; st.code(traceback.format_exc())
+
+
 # Main app
 def main():
     # Get sidebar components
@@ -1215,8 +2255,14 @@ def main():
         descriptors_fingerprints_page(timestamp)
     elif page == "Clustering & Visualization":
         clustering_visualization_page(timestamp)
-    elif page == "Advanced Analysis":
+    elif page == "Subcluster Analysis":
         advanced_analysis_page(timestamp)
+    elif page == "QSAR Modeling":
+        small_data_qsar_page(timestamp)
+    elif page == "Classification Pipeline":
+        classification_pipeline_page(timestamp)
+    elif page == "Predictive Extensions":
+        predictive_extensions_page(timestamp)
 
 if __name__ == "__main__":
     main()
