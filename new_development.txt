@@ -1,0 +1,104 @@
+Developing Quantitative Structure-Activity Relationship (QSAR) models on small datasets (e.g., fewer than 100-200 compounds) requires strict preventative measures against overfitting and chance correlations. Deep learning methods generally fail in this regime, making classical machine learning, robust feature selection, and rigorous statistical validation strictly necessary.
+
+Here is a breakdown of the methodologies for small-data QSAR development and their advanced predictive extensions.
+
+---
+
+### Part 1: QSAR Model Development on Small Data
+
+#### Baseline Regressors and Classifiers
+
+For small chemical datasets, algorithms must manage high-dimensional descriptor spaces (like Morgan fingerprints or Mordred descriptors) without fitting to noise.
+
+| Algorithm | Type | Strengths in Small Data Context |
+| --- | --- | --- |
+| **Partial Least Squares (PLS)** | Regression | Reduces collinear descriptors into latent variables. Highly interpretable and mathematically stable for sets where features outnumber samples ($p > n$). |
+| **Support Vector Machines (SVM)** | Both | Excellent generalization with limited data using the Radial Basis Function (RBF) kernel. Requires careful hyperparameter tuning ($C$ and $\gamma$). |
+| **Random Forest (RF)** | Both | Highly resistant to overfitting. Provides built-in Out-Of-Bag (OOB) error estimation and feature importance. Non-parametric, requiring minimal data scaling. |
+| **Gradient Boosting (e.g., XGBoost)** | Both | Often yields the highest predictive accuracy. Requires strict constraints (e.g., shallow tree depth, high regularization) to prevent overfitting on small datasets. |
+
+#### Feature Selection and Importance
+
+When modeling small data, reducing the feature space is required to satisfy the "Rule of 5" (at least 5 data points per descriptor in linear models) and to eliminate noise.
+
+* **Low Variance and Correlation Filters:** Remove descriptors with near-zero variance or those highly correlated with one another (e.g., Pearson $r > 0.9$).
+* **Recursive Feature Elimination (RFE):** An iterative process that trains a model (often SVM or RF), drops the weakest features based on their calculated weights or importance, and retrains until an optimal subset is found.
+* **Tree-Based Importance:** Extracting the Gini importance (mean decrease in impurity) from Random Forest models provides a direct ranking of structural features driving the biological activity.
+
+#### Cross-Validation (CV) Strategies
+
+Standard train/test splits are unreliable for small data. Resampling methods provide a more accurate estimation of model generalizability.
+
+* **Leave-One-Out Cross-Validation (LOOCV):** Iteratively trains on $N-1$ samples and tests on the single excluded sample. Computationally feasible for small data and maximizes training size, though it can sometimes yield overly optimistic variance estimates.
+* **Repeated Stratified K-Fold:** Splitting the data into $K$ folds (typically 5 or 10) while maintaining the target distribution, repeated across multiple random seeds to stabilize the performance metric.
+* **Y-Randomization (Target Shuffling):** A mandatory test for small data QSAR. The target values are randomly shuffled, and the model is retrained. If the randomized models achieve performance comparable to the true model, the original model is finding chance correlations.
+
+#### Evaluation Metrics
+
+Use multiple metrics to capture different aspects of model error and fit.
+
+**Regression Metrics:**
+
+* **$R^2$ (Coefficient of Determination):** Measures how well the training data fits the model. Increases with complexity, making it insufficient on its own.
+* **$Q^2$ (Predictive Squared Correlation Coefficient):** Calculated using cross-validated predictions. A model is generally considered acceptable if $Q^2 > 0.5$.
+
+$$Q^2 = 1 - \frac{\sum (y_{pred} - y_{exp})^2}{\sum (y_{exp} - \bar{y}_{train})^2}$$
+
+
+* **RMSE (Root Mean Square Error):** Provides the error in the original units of the biological activity (e.g., $pIC_{50}$).
+
+**Classification Metrics:**
+
+* **ROC-AUC:** Area under the Receiver Operating Characteristic curve. Evaluates the model's ability to rank actives higher than inactives.
+* **F1-Score:** The harmonic mean of precision and recall. Highly relevant when the active vs. inactive classes are imbalanced.
+
+---
+
+### Part 2: Predictive Extensions
+
+#### Confidence Intervals via Conformal Prediction
+
+Standard machine learning outputs point estimates, which do not convey the model's uncertainty regarding structurally novel compounds. Conformal prediction is a mathematical framework layered over any base model (like RF or SVM) to output statistically guaranteed prediction intervals.
+
+By comparing a new molecule's "nonconformity score" to a calibration set, the model guarantees that the true value will fall within the predicted range at a user-defined confidence level (e.g., 80% or 90%). If a molecule falls outside the model's Applicability Domain (AD), the conformal predictor naturally outputs an extremely wide, uninformative interval, signaling low confidence.
+
+#### Virtual Screening Tools
+
+Once validated, the QSAR model is deployed to screen libraries (e.g., Enamine REAL, ChEMBL) for hit identification.
+
+* **Applicability Domain (AD) Filtering:** Before predicting activity, calculate the distance of library compounds to the training set (e.g., using Tanimoto similarity or leverage/Hat matrix). Discard compounds outside the AD.
+* **Batch Execution:** When running large screening scripts via the command line, you can monitor the progression of the output logs.
+```bash
+# Example monitoring command for a screening job
+lobster -n 10 python run_virtual_screening.py --library zinc.smi --model qsar_rf.pkl
+
+```
+
+
+
+#### ADMET Hooks
+
+A compound with high predicted target affinity is useless if it is toxic or lacks bioavailability. QSAR pipelines should interface with ADMET (Absorption, Distribution, Metabolism, Excretion, and Toxicity) prediction tools.
+
+* **Open-Source APIs:** Integrate the prediction pipeline with endpoints like SwissADME or pkCSM to automatically calculate properties like blood-brain barrier (BBB) permeability, CYP450 inhibition, and Ames toxicity.
+* **Multi-objective Optimization:** Rank virtual screening hits using a composite score that weights the QSAR activity prediction against predicted ADMET liabilities.
+
+#### Multi-Target Analysis
+
+Modeling interaction against multiple targets simultaneously can compensate for limited data on a single target.
+
+* **Multi-Task Learning:** Neural networks with shared hidden layers but multiple output nodes (one per target). The shared layers learn generalized chemical representations from the aggregated data, benefiting the targets with the smallest sample sizes.
+* **Transfer Learning:** Pre-training a model on a large, related dataset (e.g., all kinase inhibitors) and fine-tuning the weights on your specific, small target dataset.
+* **Proteochemometric (PCM) Modeling:** Incorporates both ligand descriptors and protein target descriptors (e.g., amino acid sequences of the binding pocket). This allows the model to predict the affinity of an unseen ligand against an unseen, but related, target.
+
+---
+
+### Implementation Status Notes (March 2026)
+
+* **Classification UI status:** The Streamlit page named "Classification Pipeline" is currently disabled in navigation and shown as under construction.
+* **Current classification path:** Classification model training and blind screening are performed via the QSAR Modeling page in classification mode.
+* **Feature hygiene guard:** Bioassay and metadata columns (e.g., Ki, EC50, inhibition %, score, notes, IDs) are now auto-excluded from model feature matrices.
+* **Y-randomization update:** Classification Y-randomization now uses balanced accuracy instead of weighted F1 to reduce false failure signals on imbalanced datasets.
+* **Runtime improvements:** Y-randomization trials and selected cross-validation stages were parallelized to improve throughput on multicore systems.
+
+---

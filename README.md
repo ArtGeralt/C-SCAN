@@ -48,14 +48,10 @@ This provides a complete pipeline from data collection to advanced analysis, all
 - **RFE feature selection** with configurable feature count
 - **Model comparison table** and publication-quality plots saved to `models/{timestamp}/`
 
-### Classification Pipeline (new page)
-End-to-end binary activity classifier workflow in three tabs:
-
-| Tab | What it does |
-|-----|-------------|
-| **1 · Prepare Data** | Merges IC50/Ki/Kd/Inhibition ChEMBL CSVs from `known_compounds/`, assigns binary activity labels, generates RDKit descriptors or Morgan fingerprints |
-| **2 · Train Classifiers** | Trains Random Forest and/or XGBoost classifiers; shows pre-flight `activity_class` column check; displays training plots using in-memory bytes (no token-expiry flicker) |
-| **3 · Screen Compounds** | Applies the trained model to a blind set, saves `all_predictions.csv`; auto-feeds results path to Predictive Extensions |
+### Classification Pipeline
+- **Temporarily disabled in UI** and marked as under construction (`Classification Pipeline 🚧` in sidebar)
+- Classification workflows are currently available through **QSAR Modeling** (classification task mode)
+- Existing backend classification scripts are preserved and will be reconnected after redesign
 
 ### Predictive Extensions
 - **Applicability Domain (AD)**
@@ -177,6 +173,7 @@ This tool is specifically designed for scenarios where:
 ## Development Changelog
 
 ### Session — March 2026
+- Temporarily disabled **Classification Pipeline** page in UI and replaced it with an under-construction stub
 - Added **Classification Pipeline** page (Prepare Data → Train Classifiers → Screen Compounds)
 - Added **QSAR Modeling** page with auto-detection of task/target from CSV, PLS/SVM/RF/XGBoost, LOOCV + Y-Randomization
 - Added **Predictive Extensions** page: Applicability Domain (Tanimoto/leverage), Conformal Prediction, ADMET Scoring, Multi-Task QSAR
@@ -186,6 +183,10 @@ This tool is specifically designed for scenarios where:
 - Fixed **image token expiry** in Classification Pipeline tab 2 — all `st.image()` calls now pass in-memory bytes
 - `classification_model.py`: changed silent `return None` to `raise ValueError` with actionable hint on missing `activity_class` column
 - Integrated `prepare_and_train_classification.py` and `example_screen_blind_set.py` as fully interactive GUI pages
+- QSAR update: auto-exclude assay/metadata columns (e.g., Ki/EC50/score) from training features to prevent blind-set feature mismatch
+- QSAR update: changed classification Y-randomization metric to **balanced accuracy** to avoid false FAIL verdicts on imbalanced datasets
+- QSAR update: parallelized Y-randomization and LOOCV-heavy steps for faster training on multicore CPUs
+- QSAR screening: added threshold sensitivity table, probability histogram, and predicted-class diagnostics
 
 ## Future Development Plans
 
