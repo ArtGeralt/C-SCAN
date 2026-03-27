@@ -42,7 +42,7 @@ def prepare_data(input_csv, activity_column='activity_class'):
     """
     print(f"Loading data from {input_csv}")
     df = pd.read_csv(input_csv)
-    
+
     # Check if activity column exists
     if activity_column not in df.columns:
         raise ValueError(
@@ -51,32 +51,79 @@ def prepare_data(input_csv, activity_column='activity_class'):
             f"Hint: this file may be a regression dataset (pIC50). "
             f"Use the Classification Pipeline page to generate a classification dataset."
         )
-    
+
+    # Normalize labels and remove invalid placeholders.
+    activity_series = df[activity_column].astype(str).str.strip()
+    invalid_tokens = {"", "nan", "none", "null"}
+    valid_mask = ~activity_series.str.lower().isin(invalid_tokens)
+    if not bool(valid_mask.all()):
+        removed = int((~valid_mask).sum())
+        print(f"Dropping {removed} rows with invalid '{activity_column}' labels")
+        df = df.loc[valid_mask].copy()
+        activity_series = activity_series.loc[valid_mask]
+
+    # Drop classes that occur once; stratified split/CV requires at least 2.
+    class_counts = activity_series.value_counts()
+    rare_classes = class_counts[class_counts < 2].index.tolist()
+    if rare_classes:
+        rare_mask = activity_series.isin(rare_classes)
+        removed_rare = int(rare_mask.sum())
+        print(f"Dropping {removed_rare} rows from rare classes (<2 samples): {rare_classes}")
+        keep_mask = ~rare_mask
+        df = df.loc[keep_mask].copy()
+        activity_series = activity_series.loc[keep_mask]
+
+    if activity_series.nunique() < 2:
+        raise ValueError(
+            "Need at least 2 classes with >=2 samples each after cleaning activity labels."
+        )
+
     # Encode activity classes
     label_encoder = LabelEncoder()
-    y = label_encoder.fit_transform(df[activity_column])
-    
+    y = label_encoder.fit_transform(activity_series)
+
     print(f"\nActivity class distribution:")
     for i, class_name in enumerate(label_encoder.classes_):
         count = int(np.sum(y == i))
         print(f"  {class_name}: {count} ({100*count/y.shape[0]:.1f}%)")
-    
+
     # Separate features
-    exclude_cols = ['molecule_chembl_id', 'canonical_smiles', 'pIC50', 
-                    activity_column, 'Activity_Level',
-                    'IC50_pActivity', 'Kd_pActivity', 'Ki_pActivity', 'Inhibition_percent']
-    
-    # Find which columns to keep
-    feature_cols = [col for col in df.columns if col not in exclude_cols]
-    
-    X = df[feature_cols].values
-    feature_names = feature_cols
-    
+    exclude_cols = [
+        'molecule_chembl_id', 'canonical_smiles', 'SMILES', 'smiles', 'Smiles', 'pIC50',
+        activity_column, 'Activity_Level',
+        'IC50_pActivity', 'Kd_pActivity', 'Ki_pActivity', 'Inhibition_percent'
+    ]
+
+    # Candidate features before numeric coercion
+    candidate_cols = [col for col in df.columns if col not in exclude_cols]
+    if not candidate_cols:
+        raise ValueError("No candidate feature columns found after excluding metadata/target columns.")
+
+    # Coerce to numeric so string ID columns (e.g., ZINC IDs) are filtered out safely.
+    feature_df = df[candidate_cols].apply(pd.to_numeric, errors='coerce')
+
+    # Drop columns that are entirely non-numeric after coercion.
+    dropped_cols = [col for col in feature_df.columns if feature_df[col].notna().sum() == 0]
+    if dropped_cols:
+        print(f"Dropping {len(dropped_cols)} non-numeric feature columns: {dropped_cols[:10]}")
+        if len(dropped_cols) > 10:
+            print(f"... and {len(dropped_cols) - 10} more")
+        feature_df = feature_df.drop(columns=dropped_cols)
+
+    if feature_df.shape[1] == 0:
+        raise ValueError(
+            "No numeric feature columns remained after parsing. "
+            "Provide a descriptor/fingerprint table with numeric features plus activity_class."
+        )
+
+    feature_names = feature_df.columns.tolist()
+    X = feature_df.values
+
     # Clean data - replace inf and nan values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    
+
     print(f"\nDataset shape: {X.shape[0]} compounds, {X.shape[1]} features")
-    
+
     return X, y, feature_names, label_encoder, df
 
 
@@ -102,6 +149,10 @@ def train_classification_model(X_train, X_test, y_train, y_test,
     metrics : dict of performance metrics
     """
     
+    class_counts_train = pd.Series(y_train).value_counts()
+    min_class_count_train = int(class_counts_train.min()) if not class_counts_train.empty else 0
+    cv_folds = max(2, min(5, min_class_count_train)) if min_class_count_train >= 2 else 2
+
     if model_type == 'rf':
         if optimize:
             print("Optimizing Random Forest hyperparameters...")
@@ -113,7 +164,7 @@ def train_classification_model(X_train, X_test, y_train, y_test,
                 'class_weight': ['balanced', None]
             }
             model = RandomForestClassifier(random_state=42, n_jobs=-1)
-            grid_search = GridSearchCV(model, param_grid, cv=5, 
+            grid_search = GridSearchCV(model, param_grid, cv=cv_folds, 
                                       scoring='f1_weighted', n_jobs=-1, verbose=1)
             grid_search.fit(X_train, y_train)
             model = grid_search.best_estimator_
@@ -139,7 +190,7 @@ def train_classification_model(X_train, X_test, y_train, y_test,
                 'colsample_bytree': [0.8, 1.0]
             }
             model = XGBClassifier(random_state=42, n_jobs=-1, eval_metric='logloss')
-            grid_search = GridSearchCV(model, param_grid, cv=5, 
+            grid_search = GridSearchCV(model, param_grid, cv=cv_folds, 
                                       scoring='f1_weighted', n_jobs=-1, verbose=1)
             grid_search.fit(X_train, y_train)
             model = grid_search.best_estimator_
@@ -331,9 +382,14 @@ def build_classification_model(input_csv, activity_column='activity_class',
     assert feature_names is not None
     assert label_encoder is not None
 
-    # Split data
+    # Split data with stratification-safe test size.
+    y_n = int(np.asarray(y).shape[0])
+    n_classes = int(np.unique(y).shape[0])
+    min_test_fraction = n_classes / max(y_n, 1)
+    effective_test_size = max(float(test_size), min_test_fraction)
+
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=42, stratify=y
+        X, y, test_size=effective_test_size, random_state=42, stratify=y
     )
     
     # Standardize features

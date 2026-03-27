@@ -19,7 +19,7 @@ class ActivityClassifier:
     Can be used for virtual screening to identify high-efficiency compounds.
     """
     
-    def __init__(self, model_path, scaler_path, label_encoder_path, 
+    def __init__(self, model_path, scaler_path=None, label_encoder_path=None, 
                  feature_names_path=None, use_fingerprints=False):
         """
         Initialize the classifier with trained model files
@@ -28,10 +28,10 @@ class ActivityClassifier:
         -----------
         model_path : str
             Path to saved classifier model (.pkl)
-        scaler_path : str
-            Path to saved scaler (.pkl)
-        label_encoder_path : str
-            Path to saved label encoder (.pkl)
+        scaler_path : str, optional
+            Path to saved scaler (.pkl). If missing, raw features are used.
+        label_encoder_path : str, optional
+            Path to saved label encoder (.pkl). If missing, raw class labels are used.
         feature_names_path : str, optional
             Path to saved feature names (.pkl)
         use_fingerprints : bool
@@ -41,30 +41,48 @@ class ActivityClassifier:
         # Check if files exist
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found: {model_path}")
-        if not os.path.exists(scaler_path):
+        if scaler_path and not os.path.exists(scaler_path):
             raise FileNotFoundError(f"Scaler file not found: {scaler_path}")
-        if not os.path.exists(label_encoder_path):
+        if label_encoder_path and not os.path.exists(label_encoder_path):
             raise FileNotFoundError(f"Label encoder file not found: {label_encoder_path}")
         
         # Load model components
         with open(model_path, 'rb') as f:
             self.model = pickle.load(f)
-        with open(scaler_path, 'rb') as f:
-            self.scaler = pickle.load(f)
-        with open(label_encoder_path, 'rb') as f:
-            self.label_encoder = pickle.load(f)
+        if scaler_path and os.path.exists(scaler_path):
+            with open(scaler_path, 'rb') as f:
+                self.scaler = pickle.load(f)
+        else:
+            self.scaler = None
+            print("[WARNING] Scaler file not found. Proceeding without external scaling.")
+
+        if label_encoder_path and os.path.exists(label_encoder_path):
+            with open(label_encoder_path, 'rb') as f:
+                self.label_encoder = pickle.load(f)
+        else:
+            self.label_encoder = None
+            print("[WARNING] Label encoder file not found. Using raw model class labels.")
         
         # Load feature names if provided
         if feature_names_path and os.path.exists(feature_names_path):
-            with open(feature_names_path, 'rb') as f:
-                self.feature_names = pickle.load(f)
+            if str(feature_names_path).lower().endswith('.txt'):
+                with open(feature_names_path, 'r', encoding='utf-8', errors='replace') as f:
+                    self.feature_names = [line.strip() for line in f if line.strip()]
+            else:
+                with open(feature_names_path, 'rb') as f:
+                    self.feature_names = pickle.load(f)
         else:
             self.feature_names = None
         
         self.use_fingerprints = use_fingerprints
         
         print(f"[OK] Loaded classification model")
-        print(f"  Classes: {', '.join([str(c) for c in self.label_encoder.classes_])}")
+        if self.label_encoder is not None and hasattr(self.label_encoder, 'classes_'):
+            print(f"  Classes: {', '.join([str(c) for c in self.label_encoder.classes_])}")
+        elif hasattr(self.model, 'classes_'):
+            print(f"  Classes: {', '.join([str(c) for c in self.model.classes_])}")
+        else:
+            print("  Classes: unknown")
         print(f"  Feature type: {'Fingerprints' if use_fingerprints else 'Descriptors'}")
     
     def _generate_fingerprints(self, smiles_list, radius=2, nBits=2048):
@@ -234,10 +252,13 @@ class ActivityClassifier:
         
         # Scale features and predict
         X = np.array(features)
-        X_scaled = self.scaler.transform(X)
-        
-        predictions = self.model.predict(X_scaled)
-        predicted_classes = self.label_encoder.inverse_transform(predictions)
+        X_in = self.scaler.transform(X) if self.scaler is not None else X
+
+        predictions = self.model.predict(X_in)
+        if self.label_encoder is not None:
+            predicted_classes = self.label_encoder.inverse_transform(predictions)
+        else:
+            predicted_classes = predictions
         
         # Create results dataframe
         results_data = {
@@ -256,9 +277,16 @@ class ActivityClassifier:
             results = pd.DataFrame(results_data)
         
         # Add probabilities for each class
-        if return_probabilities:
-            probabilities = self.model.predict_proba(X_scaled)
-            for i, class_name in enumerate(self.label_encoder.classes_):
+        if return_probabilities and hasattr(self.model, 'predict_proba'):
+            probabilities = self.model.predict_proba(X_in)
+            if self.label_encoder is not None and hasattr(self.label_encoder, 'classes_'):
+                class_labels = [str(c) for c in self.label_encoder.classes_]
+            elif hasattr(self.model, 'classes_'):
+                class_labels = [str(c) for c in self.model.classes_]
+            else:
+                class_labels = [str(i) for i in range(probabilities.shape[1])]
+
+            for i, class_name in enumerate(class_labels):
                 results[f'Prob_{class_name}'] = probabilities[:, i]
         
         # Report errors
@@ -333,7 +361,8 @@ class ActivityClassifier:
         # Check if target class exists
         prob_col = f'Prob_{target_class}'
         if prob_col not in results.columns:
-            available_classes = ', '.join(self.label_encoder.classes_)
+            available_prob_cols = [c.replace('Prob_', '') for c in results.columns if str(c).startswith('Prob_')]
+            available_classes = ', '.join([str(c) for c in available_prob_cols]) if available_prob_cols else 'unknown'
             print(f"Error: Target class '{target_class}' not found.")
             print(f"Available classes: {available_classes}")
             return None
@@ -351,8 +380,10 @@ class ActivityClassifier:
         results.to_csv(f"{output_dir}/all_predictions.csv", index=False)
         
         # Filter and save high-efficiency compounds
+        target_class_str = str(target_class)
+        pred_class_str = results['Predicted_Class'].astype(str)
         high_efficiency = results[
-            (results['Predicted_Class'] == target_class) & 
+            (pred_class_str == target_class_str) &
             (results['High_Confidence'])
         ]
         high_efficiency.to_csv(f"{output_dir}/high_efficiency_compounds.csv", index=False)
@@ -363,8 +394,15 @@ class ActivityClassifier:
         print(f"{'='*60}")
         print(f"\nTotal compounds screened: {len(results)}")
         print(f"\nPredicted class distribution:")
-        for class_name in self.label_encoder.classes_:
-            count = sum(results['Predicted_Class'] == class_name)
+        if self.label_encoder is not None and hasattr(self.label_encoder, 'classes_'):
+            class_names = [str(c) for c in self.label_encoder.classes_]
+        elif hasattr(self.model, 'classes_'):
+            class_names = [str(c) for c in self.model.classes_]
+        else:
+            class_names = sorted(results['Predicted_Class'].astype(str).unique().tolist())
+
+        for class_name in class_names:
+            count = int((results['Predicted_Class'].astype(str) == str(class_name)).sum())
             print(f"  {class_name}: {count} ({100*count/len(results):.1f}%)")
         
         print(f"\nHigh-confidence {target_class} compounds: {len(high_efficiency)}")
@@ -487,10 +525,29 @@ def load_classifier(model_dir, model_type='rf'):
         Loaded classifier ready for prediction
     """
     
-    model_path = f"{model_dir}/{model_type}_classifier.pkl"
-    scaler_path = f"{model_dir}/{model_type}_scaler.pkl"
-    encoder_path = f"{model_dir}/{model_type}_label_encoder.pkl"
-    features_path = f"{model_dir}/{model_type}_feature_names.pkl"
+    classifier_model_path = f"{model_dir}/{model_type}_classifier.pkl"
+    generic_model_path = f"{model_dir}/{model_type}_model.pkl"
+    model_path = classifier_model_path if os.path.exists(classifier_model_path) else generic_model_path
+
+    def _first_existing(candidates):
+        for p in candidates:
+            if p and os.path.exists(p):
+                return p
+        return None
+
+    scaler_path = _first_existing([
+        f"{model_dir}/{model_type}_scaler.pkl",
+        f"{model_dir}/scaler.pkl",
+    ])
+    encoder_path = _first_existing([
+        f"{model_dir}/{model_type}_label_encoder.pkl",
+        f"{model_dir}/label_encoder.pkl",
+    ])
+    features_path = _first_existing([
+        f"{model_dir}/{model_type}_feature_names.pkl",
+        f"{model_dir}/feature_names.pkl",
+        f"{model_dir}/selected_features.txt",
+    ])
     
     # Determine if using fingerprints or descriptors
     use_fingerprints = 'fingerprints' in model_dir or 'fingerprint' in model_dir

@@ -47,6 +47,28 @@ def safe_image_display(image_path, alt_text="No image available"):
     else:
         st.info(f"{alt_text} (File not found: {os.path.basename(image_path)})")
 
+
+def show_large_dataframe(df, title=None, max_rows=200, key_prefix="df"):
+    """Display a sampled preview for large tables and expose full-download CSV."""
+    if title:
+        st.subheader(title)
+
+    total_rows = len(df)
+    if total_rows > max_rows:
+        st.caption(f"Showing first {max_rows} of {total_rows} rows for performance.")
+        st.dataframe(df.head(max_rows))
+    else:
+        st.dataframe(df)
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download full table (CSV)",
+        data=csv_bytes,
+        file_name=f"{key_prefix}_full.csv",
+        mime="text/csv",
+        key=f"{key_prefix}_download",
+    )
+
 # Available descriptors list
 AVAILABLE_DESCRIPTORS = {
     "Lipinski properties": {
@@ -97,6 +119,142 @@ def show_file_info(filepath):
         return f"File size: {size_kb:.1f} KB | Last modified: {mod_time.strftime('%Y-%m-%d %H:%M:%S')}"
     return "File not found"
 
+
+def _read_table_with_auto_sep(path_or_buffer):
+    """Read CSV/TSV with simple separator sniffing and UTF-8 fallback handling."""
+    try:
+        return pd.read_csv(path_or_buffer)
+    except Exception:
+        return pd.read_csv(path_or_buffer, sep=None, engine="python", encoding="utf-8", on_bad_lines="skip")
+
+
+def _find_default_smiles_column(columns):
+    """Pick a likely SMILES column name from common variants."""
+    preferred = ["SMILES", "canonical_smiles", "smiles", "Smiles"]
+    cols = list(columns)
+    for name in preferred:
+        if name in cols:
+            return name
+    for c in cols:
+        if "smiles" in str(c).lower():
+            return c
+    return cols[0] if cols else None
+
+
+def _read_csv_columns_fast(csv_path):
+    """Read only CSV headers (fast) and return normalized/literal columns."""
+    try:
+        cols = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    except Exception:
+        try:
+            cols = pd.read_csv(csv_path, sep=None, engine="python", nrows=0).columns.tolist()
+        except Exception:
+            return [], []
+    cols_norm = [str(c).strip().lower() for c in cols]
+    return cols, cols_norm
+
+
+def _scan_analysis_folder(folder_path):
+    """Scan a folder recursively and infer best files for data/desc/fp/clustered slots."""
+    csv_files = glob.glob(os.path.join(folder_path, "**", "*.csv"), recursive=True)
+    if not csv_files:
+        return {
+            "data_path": None,
+            "descriptors_path": None,
+            "fingerprints_path": None,
+            "clustered_path": None,
+            "details": [],
+        }
+
+    rows = []
+    for path in csv_files:
+        base = os.path.basename(path).lower()
+        cols_raw, cols_norm = _read_csv_columns_fast(path)
+        if not cols_raw:
+            continue
+
+        has_smiles = any(c in ["canonical_smiles", "smiles"] for c in cols_norm)
+        has_pic50 = "pic50" in cols_norm
+        has_cluster = "cluster" in cols_norm
+        has_bit_cols = any(str(c).startswith("bit_") for c in cols_raw)
+        has_descriptor_like = any(
+            c in cols_norm for c in [
+                "molwt", "mollogp", "tpsa", "numhacceptors", "numhdonors",
+                "numrotatablebonds", "fractioncsp3", "ringcount"
+            ]
+        )
+
+        descriptors_score = (
+            (3 if "descriptor" in base else 0)
+            + (2 if has_descriptor_like else 0)
+            + (1 if has_smiles else 0)
+            - (2 if has_bit_cols else 0)
+        )
+        fingerprints_score = (
+            (3 if "fingerprint" in base else 0)
+            + (3 if has_bit_cols else 0)
+            + (1 if has_smiles else 0)
+            - (1 if has_cluster else 0)
+        )
+        clustered_score = (
+            (3 if "cluster" in base else 0)
+            + (4 if has_cluster else 0)
+            + (1 if has_bit_cols else 0)
+        )
+        data_score = (
+            (4 if has_smiles else 0)
+            + (2 if has_pic50 else 0)
+            + (1 if any(k in base for k in ["pic50", "hit", "docking", "score", "data", "screen"]) else 0)
+            - (1 if has_cluster else 0)
+            - (1 if has_bit_cols else 0)
+        )
+
+        rows.append({
+            "path": path,
+            "filename": os.path.basename(path),
+            "n_columns": len(cols_raw),
+            "has_smiles": has_smiles,
+            "has_pic50": has_pic50,
+            "has_cluster": has_cluster,
+            "has_bit_cols": has_bit_cols,
+            "descriptors_score": descriptors_score,
+            "fingerprints_score": fingerprints_score,
+            "clustered_score": clustered_score,
+            "data_score": data_score,
+        })
+
+    if not rows:
+        return {
+            "data_path": None,
+            "descriptors_path": None,
+            "fingerprints_path": None,
+            "clustered_path": None,
+            "details": [],
+        }
+
+    df_rows = pd.DataFrame(rows)
+
+    def _pick(col):
+        _df = df_rows.sort_values(col, ascending=False)
+        top = _df.iloc[0]
+        return top["path"] if top[col] > 0 else None
+
+    return {
+        "data_path": _pick("data_score"),
+        "descriptors_path": _pick("descriptors_score"),
+        "fingerprints_path": _pick("fingerprints_score"),
+        "clustered_path": _pick("clustered_score"),
+        "details": df_rows.sort_values(["data_score", "descriptors_score", "fingerprints_score", "clustered_score"], ascending=False),
+    }
+
+
+def _normalize_file_prefix(prefix: str | None) -> str:
+    """Sanitize file prefix used for generated output filenames."""
+    raw = (prefix or "project").strip()
+    safe = "".join(ch if (ch.isalnum() or ch in ["_", "-"]) else "_" for ch in raw)
+    safe = safe.strip("_")
+    return safe or "project"
+
 # Function to create directory structure
 def create_project_dirs(timestamp):
     base_dir = f"data/processed/{timestamp}"
@@ -129,6 +287,7 @@ def _init_session() -> None:
         "clustered_path": None,
         "classification_model_dir": None,
         "screening_results_path": None,
+        "file_prefix": "project",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -179,7 +338,15 @@ def sidebar_components():
         ),
     )
     # Mirror the widget value back so other pages can read the current project name.
+    timestamp = (timestamp or datetime.now().strftime("%Y%m%d")).strip()
     st.session_state.active_timestamp = timestamp
+
+    file_prefix_input = st.sidebar.text_input(
+        "Output File Prefix",
+        value=st.session_state.get("file_prefix", "project"),
+        help="Prefix for generated files (e.g., kit, docking_hits, campaign_A)",
+    )
+    st.session_state.file_prefix = _normalize_file_prefix(file_prefix_input)
 
     # Create a base directory for the project
     if timestamp:
@@ -203,7 +370,7 @@ def sidebar_components():
             "Clustering & Visualization",
             "Subcluster Analysis",
             "QSAR Modeling",
-            "Classification Pipeline",
+            "Classification Pipeline 🚧",
             "Predictive Extensions",
         ],
     )
@@ -231,6 +398,7 @@ def sidebar_components():
 def data_collection_page(timestamp, chembl_id):
     st.header("KIT Inhibitor Data Collection")
     _session_status_bar()
+    file_prefix = _normalize_file_prefix(st.session_state.get("file_prefix", "project"))
 
     # Show banner from a previous load and immediately clear it
     if st.session_state.get("_load_banner"):
@@ -288,7 +456,7 @@ def data_collection_page(timestamp, chembl_id):
                                     final_df = cleaned_df
                                 
                                 # Save processed data
-                                output_path = f"data/processed/{timestamp}/kit_pic50_{timestamp}.csv"
+                                output_path = f"data/processed/{timestamp}/{file_prefix}_pic50_{timestamp}.csv"
                                 final_df.to_csv(output_path, index=False)
                                 st.success(f"✅ Saved {len(final_df)} compounds to {output_path}")
                                 st.code(f"File saved at: {os.path.abspath(output_path)}")
@@ -313,7 +481,7 @@ def data_collection_page(timestamp, chembl_id):
                                 # Quick distribution visualization
                                 st.subheader("Activity Distribution")
                                 fig, ax = plt.subplots(figsize=(10, 4))
-                                sns.histplot(final_df['pIC50'], kde=True, ax=ax)
+                                sns.histplot(data=final_df, x='pIC50', kde=True, ax=ax)
                                 plt.title("Distribution of pIC50 Values")
                                 st.pyplot(fig)
                     else:
@@ -410,6 +578,9 @@ def data_collection_page(timestamp, chembl_id):
                     st.error(f"Error reading dataset preview: {str(e)}")
             
             if st.button("Load Selected Dataset"):
+                if not selected_file:
+                    st.error("Please select a dataset first.")
+                    return
                 with st.spinner("Loading dataset and associated files..."):
                     try:
                         # Load main dataset
@@ -497,10 +668,197 @@ def data_collection_page(timestamp, chembl_id):
         else:
             st.info("No processed data files found. Fetch new data from ChEMBL.")
 
+        st.divider()
+        st.subheader("Load Analysis Session from Folder")
+        st.caption(
+            "Select any folder (including docking/top-hits outputs). "
+            "The app scans recursively and auto-maps Data/Descriptors/Fingerprints/Clustered files."
+        )
+
+        folder_default = st.session_state.get("scan_folder_path") or f"data/processed/{timestamp}"
+        scan_folder_path = st.text_input(
+            "Folder path",
+            value=folder_default,
+            key="scan_folder_path",
+            help="Example: data/processed/20251027 or any custom results folder",
+        )
+
+        if st.button("Scan Folder", key="scan_analysis_folder_btn"):
+            if not os.path.isdir(scan_folder_path):
+                st.error(f"Folder not found: {scan_folder_path}")
+            else:
+                scan_result = _scan_analysis_folder(scan_folder_path)
+                st.session_state["scan_analysis_result"] = scan_result
+                st.success("Folder scan complete")
+
+        scan_result = st.session_state.get("scan_analysis_result")
+        if scan_result:
+            mapped_keys = [
+                ("Data", "data_path"),
+                ("Descriptors", "descriptors_path"),
+                ("Fingerprints", "fingerprints_path"),
+                ("Clustered", "clustered_path"),
+            ]
+
+            st.write("**Detected files:**")
+            for label, key in mapped_keys:
+                _p = scan_result.get(key)
+                if _p and os.path.exists(_p):
+                    st.success(f"✅ {label}: {os.path.basename(_p)}")
+                    st.caption(_p)
+                else:
+                    st.info(f"○ {label}: not found")
+
+            details_df = scan_result.get("details")
+            if isinstance(details_df, pd.DataFrame) and not details_df.empty:
+                with st.expander("Scan details", expanded=False):
+                    preview_cols = [
+                        "filename", "n_columns", "has_smiles", "has_pic50", "has_cluster", "has_bit_cols",
+                        "data_score", "descriptors_score", "fingerprints_score", "clustered_score",
+                    ]
+                    st.dataframe(details_df[preview_cols].head(200))
+
+            can_load_scan = any(scan_result.get(k) for _, k in mapped_keys)
+            if st.button("Load Scanned Session", key="load_scanned_session_btn", disabled=not can_load_scan):
+                # Reset session pointers, then load detected paths.
+                st.session_state.data_path = None
+                st.session_state.descriptors_path = None
+                st.session_state.fingerprints_path = None
+                st.session_state.clustered_path = None
+
+                loaded_components = []
+                for label, key in mapped_keys:
+                    _p = scan_result.get(key)
+                    if _p and os.path.exists(_p):
+                        st.session_state[key] = _p
+                        loaded_components.append(label)
+
+                # Try loading main data frame for immediate downstream use.
+                _loaded_data_path = st.session_state.get("data_path")
+                if isinstance(_loaded_data_path, str) and _loaded_data_path:
+                    try:
+                        st.session_state.processed_data = pd.read_csv(_loaded_data_path)
+                    except Exception:
+                        st.warning("Data file path loaded, but preview dataframe could not be parsed.")
+
+                # If folder basename looks like a timestamp/name, sync active project label.
+                folder_name = os.path.basename(os.path.normpath(scan_folder_path))
+                if folder_name:
+                    st.session_state.active_timestamp = folder_name
+
+                st.session_state["_load_banner"] = (
+                    f"Session loaded from folder: {scan_folder_path} | "
+                    + (", ".join(loaded_components) if loaded_components else "No matching components found")
+                )
+                st.rerun()
+
+        st.divider()
+        st.subheader("Load Dataset from Computer")
+        st.caption(
+            "Upload a CSV/TSV from your computer, then choose which column contains SMILES strings."
+        )
+
+        uploaded_file = st.file_uploader(
+            "Choose file",
+            type=["csv", "tsv", "txt", "smi"],
+            key="external_dataset_uploader",
+        )
+
+        if uploaded_file is not None:
+            try:
+                ext_df = _read_table_with_auto_sep(uploaded_file)
+                st.success(f"Loaded file: {uploaded_file.name} ({len(ext_df)} rows)")
+
+                if ext_df.empty or len(ext_df.columns) == 0:
+                    st.error("Uploaded file has no readable columns.")
+                else:
+                    default_smiles_col = _find_default_smiles_column(ext_df.columns)
+                    smiles_col = st.selectbox(
+                        "SMILES column",
+                        options=list(ext_df.columns),
+                        index=list(ext_df.columns).index(default_smiles_col) if default_smiles_col in list(ext_df.columns) else 0,
+                        key="external_smiles_col",
+                    )
+
+                    id_col_candidates = [
+                        c for c in ext_df.columns
+                        if str(c).lower() in ["molecule_chembl_id", "compound_id", "mol_id", "id"]
+                    ]
+                    id_col = st.selectbox(
+                        "Optional ID column",
+                        options=["(auto-generate IDs)"] + list(ext_df.columns),
+                        index=(1 + list(ext_df.columns).index(id_col_candidates[0])) if id_col_candidates else 0,
+                        key="external_id_col",
+                    )
+
+                    st.write("Preview:")
+                    st.dataframe(ext_df.head(5))
+
+                    # Quick validity estimate on a sample to catch wrong column selections.
+                    sample_series = ext_df[smiles_col].dropna().astype(str).head(500)
+                    if len(sample_series) > 0:
+                        valid_n = int(sample_series.apply(lambda s: Chem.MolFromSmiles(s.strip()) is not None).sum())
+                        valid_pct = 100.0 * valid_n / len(sample_series)
+                        if valid_pct < 30:
+                            st.warning(
+                                f"Selected SMILES column appears mostly invalid ({valid_pct:.1f}% valid in sample). "
+                                "Please verify you selected the correct column."
+                            )
+                        else:
+                            st.success(f"SMILES validity check: {valid_pct:.1f}% valid in sample")
+
+                    if st.button("Load Uploaded Dataset", key="load_uploaded_dataset"):
+                        work_df = ext_df.copy()
+
+                        work_df = work_df.dropna(subset=[smiles_col])
+                        work_df[smiles_col] = work_df[smiles_col].astype(str).str.strip()
+                        work_df = work_df[work_df[smiles_col] != ""].copy()
+
+                        if id_col != "(auto-generate IDs)" and id_col in work_df.columns:
+                            ids = work_df[id_col].astype(str).fillna("").tolist()
+                        else:
+                            ids = [f"MOL_{i+1}" for i in range(len(work_df))]
+
+                        # Rename SMILES column to canonical_smiles if needed, preserving ALL other columns.
+                        if smiles_col != "canonical_smiles":
+                            work_df = work_df.rename(columns={smiles_col: "canonical_smiles"})
+                        work_df["canonical_smiles"] = work_df["canonical_smiles"].astype(str)
+
+                        # Ensure ID column is called molecule_chembl_id.
+                        if id_col != "(auto-generate IDs)" and id_col in work_df.columns and id_col != "molecule_chembl_id":
+                            work_df = work_df.rename(columns={id_col: "molecule_chembl_id"})
+                        elif "molecule_chembl_id" not in work_df.columns:
+                            work_df.insert(0, "molecule_chembl_id", ids)
+
+                        # Add pIC50 placeholder only if not already present.
+                        if "pIC50" not in work_df.columns:
+                            work_df["pIC50"] = np.nan
+
+                        # Reorder: ID, SMILES, pIC50 first, then everything else.
+                        priority_cols = [c for c in ["molecule_chembl_id", "canonical_smiles", "pIC50"] if c in work_df.columns]
+                        rest_cols = [c for c in work_df.columns if c not in priority_cols]
+                        standardized_df = work_df[priority_cols + rest_cols]
+
+                        output_path = f"data/processed/{timestamp}/external_smiles_{timestamp}.csv"
+                        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                        standardized_df.to_csv(output_path, index=False)
+
+                        st.session_state.processed_data = standardized_df
+                        st.session_state.data_path = output_path
+                        st.session_state.active_timestamp = timestamp
+                        st.session_state["_load_banner"] = (
+                            f"External dataset loaded: {len(standardized_df)} compounds from {uploaded_file.name}"
+                        )
+                        st.rerun()
+
+            except Exception as e:
+                st.error(f"Error reading uploaded file: {str(e)}")
+
 # Descriptors and fingerprints page
 def descriptors_fingerprints_page(timestamp):
     st.header("Molecular Descriptors & Fingerprints")
     _session_status_bar()
+    file_prefix = _normalize_file_prefix(st.session_state.get("file_prefix", "project"))
     # Check if we have data
     if 'data_path' not in st.session_state:
         st.warning("Please fetch or load data first from the Data Collection page")
@@ -564,11 +922,57 @@ def descriptors_fingerprints_page(timestamp):
                 # Call descriptor generation function with selected descriptors
                 with st.spinner(f"Generating {len(selected_descriptors)} molecular descriptors..."):
                     try:
-                        output_file = f"data/processed/{timestamp}/kit_descriptors_selected.csv"
+                        progress_ph = st.empty()
+                        status_ph = st.empty()
+                        metrics_ph = st.empty()
+                        progress_bar = progress_ph.progress(0.0, text="Starting descriptor generation...")
+
+                        def descriptor_progress(update: dict):
+                            current = int(update.get("current", 0))
+                            total = max(int(update.get("total", 0)), 1)
+                            stage = str(update.get("stage", "descriptors"))
+                            message = str(update.get("message", "")).strip()
+
+                            if stage == "descriptors":
+                                frac = 0.05 + 0.9 * min(max(current / total, 0.0), 1.0)
+                            elif stage == "cleanup":
+                                frac = 0.97
+                            elif stage == "save":
+                                frac = 1.0
+                            else:
+                                frac = 0.02
+
+                            progress_bar.progress(frac, text=f"{stage}: {current}/{total}")
+                            if message:
+                                status_ph.write(message)
+
+                            if "valid" in update or "invalid" in update:
+                                valid_n = int(update.get("valid", 0))
+                                invalid_n = int(update.get("invalid", 0))
+                                extra = []
+                                if "dropped_invalid" in update:
+                                    extra.append(f"Dropped invalid: {int(update.get('dropped_invalid', 0))}")
+                                if "nan_filled" in update:
+                                    extra.append(f"NaN filled: {int(update.get('nan_filled', 0))}")
+                                metrics_ph.caption(
+                                    f"Valid: {valid_n} | Invalid: {invalid_n}"
+                                    + (" | " + " | ".join(extra) if extra else "")
+                                )
+
+                        output_file = f"data/processed/{timestamp}/{file_prefix}_descriptors_selected.csv"
                         
                         # Custom implementation to use our selected descriptors
                         from descriptors import generate_descriptors
-                        df = generate_descriptors(data_path, output_file, selected_only=True)
+                        df = generate_descriptors(
+                            data_path,
+                            output_file,
+                            selected_only=True,
+                            descriptor_calculators=descriptor_calculators,
+                            progress_callback=descriptor_progress,
+                            progress_step=500,
+                        )
+
+                        progress_bar.progress(1.0, text="Descriptor generation complete")
                         
                         st.success(f"Generated {len(selected_descriptors)} descriptors for {len(df)} compounds")
                         st.session_state.descriptors_path = output_file
@@ -598,14 +1002,57 @@ def descriptors_fingerprints_page(timestamp):
         if st.button("Generate Fingerprints"):
             with st.spinner("Generating fingerprints..."):
                 try:
-                    output_file = f"data/processed/{timestamp}/kit_fingerprints.csv"
+                    progress_ph = st.empty()
+                    status_ph = st.empty()
+                    metrics_ph = st.empty()
+                    progress_bar = progress_ph.progress(0.0, text="Starting fingerprint generation...")
+
+                    def fingerprint_progress(update: dict):
+                        current = int(update.get("current", 0))
+                        total = max(int(update.get("total", 0)), 1)
+                        stage = str(update.get("stage", "fingerprints"))
+                        message = str(update.get("message", "")).strip()
+
+                        if stage == "fingerprints":
+                            frac = 0.05 + 0.9 * min(max(current / total, 0.0), 1.0)
+                        elif stage == "cleanup":
+                            frac = 0.97
+                        elif stage == "save":
+                            frac = 1.0
+                        else:
+                            frac = 0.02
+
+                        progress_bar.progress(frac, text=f"{stage}: {current}/{total}")
+                        if message:
+                            status_ph.write(message)
+
+                        if "valid" in update or "invalid" in update:
+                            valid_n = int(update.get("valid", 0))
+                            invalid_n = int(update.get("invalid", 0))
+                            metrics_ph.caption(f"Valid: {valid_n} | Invalid: {invalid_n}")
+
+                    output_file = f"data/processed/{timestamp}/{file_prefix}_fingerprints.csv"
                     
                     if fp_type == "Morgan (ECFP)":
-                        df = generate_fingerprints(data_path, output_file, radius=radius, nBits=nbits)
+                        df = generate_fingerprints(
+                            data_path,
+                            output_file,
+                            radius=radius,
+                            nBits=nbits,
+                            progress_callback=fingerprint_progress,
+                            progress_step=500,
+                        )
                     else:
                         # For future implementation of other fingerprint types
                         st.warning(f"{fp_type} not fully implemented yet, using Morgan fingerprints")
-                        df = generate_fingerprints(data_path, output_file)
+                        df = generate_fingerprints(
+                            data_path,
+                            output_file,
+                            progress_callback=fingerprint_progress,
+                            progress_step=500,
+                        )
+
+                    progress_bar.progress(1.0, text="Fingerprint generation complete")
                     
                     st.success(f"Generated fingerprints for {len(df)} compounds")
                     st.session_state.fingerprints_path = output_file
@@ -624,6 +1071,7 @@ def descriptors_fingerprints_page(timestamp):
 def clustering_visualization_page(timestamp):
     st.header("Clustering & Visualization")
     _session_status_bar()
+    file_prefix = _normalize_file_prefix(st.session_state.get("file_prefix", "project"))
     # Check for required data
     if 'data_path' not in st.session_state:
         st.warning("Please fetch or load data first from the Data Collection page")
@@ -633,7 +1081,10 @@ def clustering_visualization_page(timestamp):
     data_path = st.session_state.data_path
     fingerprints_path = st.session_state.get('fingerprints_path', None)
     descriptors_path = st.session_state.get('descriptors_path', None)
-    clustered_path = f"data/processed/{timestamp}/clusters/kit_fingerprints_clustered.csv"
+    clustered_path = (
+        st.session_state.get('clustered_path')
+        or f"data/processed/{timestamp}/clusters/{file_prefix}_fingerprints_clustered.csv"
+    )
     
     # Tabs for different analyses
     tab1, tab2, tab3 = st.tabs(["Basic Visualization", "Clustering", "Chemical Space"])
@@ -766,7 +1217,7 @@ def clustering_visualization_page(timestamp):
                         
                         # IMPORTANT: Explicitly save the clustered data to the correct path
                         os.makedirs(f"data/processed/{timestamp}/clusters", exist_ok=True)
-                        clustered_output_path = f"data/processed/{timestamp}/clusters/kit_fingerprints_clustered.csv"
+                        clustered_output_path = f"data/processed/{timestamp}/clusters/{file_prefix}_fingerprints_clustered.csv"
                         
                         # Save the clustered dataframe
                         df_clustered.to_csv(clustered_output_path, index=False)
@@ -794,7 +1245,7 @@ def clustering_visualization_page(timestamp):
                         cluster_counts = df_clustered['cluster'].value_counts().sort_index()
                         
                         fig, ax = plt.subplots(figsize=(10, 5))
-                        bars = ax.bar(cluster_counts.index, cluster_counts.values)
+                        bars = ax.bar(cluster_counts.index.to_numpy(), cluster_counts.to_numpy())
                         
                         # Add labels
                         for bar in bars:
@@ -809,10 +1260,28 @@ def clustering_visualization_page(timestamp):
                         
                         # Show activity by cluster
                         st.subheader("Activity by Cluster")
-                        fig2, ax2 = plt.subplots(figsize=(10, 5))
-                        sns.boxplot(x='cluster', y='pIC50', data=df_clustered, ax=ax2)
-                        ax2.set_title('pIC50 Distribution by Cluster')
-                        st.pyplot(fig2)
+                        if 'pIC50' not in df_clustered.columns:
+                            st.info("No pIC50 column found. Activity boxplot is skipped.")
+                        else:
+                            activity_df = df_clustered.copy()
+                            activity_df['pIC50'] = pd.to_numeric(activity_df['pIC50'], errors='coerce')
+                            activity_df = activity_df.dropna(subset=['cluster', 'pIC50'])
+
+                            if activity_df.empty:
+                                st.info("No valid pIC50 values available. Activity boxplot is skipped.")
+                            else:
+                                fig2, ax2 = plt.subplots(figsize=(10, 5))
+                                sns.boxplot(x='cluster', y='pIC50', data=activity_df, ax=ax2)
+                                ax2.set_title('pIC50 Distribution by Cluster')
+                                st.pyplot(fig2)
+
+                        # Show direct preview of the t-SNE cluster embedding image.
+                        st.subheader("Cluster Embedding Preview")
+                        cluster_img_path = f"data/processed/{timestamp}/clusters/fingerprint_clusters.png"
+                        safe_image_display(
+                            cluster_img_path,
+                            "Cluster embedding image not available yet."
+                        )
                         
                     except Exception as e:
                         st.error(f"Error during clustering: {str(e)}")
@@ -820,6 +1289,12 @@ def clustering_visualization_page(timestamp):
                         st.code(traceback.format_exc())
         else:
             st.warning("Please generate fingerprints first on the Descriptors & Fingerprints page")
+
+        # Also show latest available clustering image for convenience.
+        latest_cluster_img = f"data/processed/{timestamp}/clusters/fingerprint_clusters.png"
+        if os.path.exists(latest_cluster_img):
+            st.subheader("Latest Cluster Embedding")
+            safe_image_display(latest_cluster_img, "Cluster embedding image not available")
     
     # Tab 3: Chemical Space
     with tab3:
@@ -1069,6 +1544,7 @@ def clustering_visualization_page(timestamp):
 def advanced_analysis_page(timestamp):
     st.header("Subcluster Analysis")
     _session_status_bar()
+    file_prefix = _normalize_file_prefix(st.session_state.get("file_prefix", "project"))
     # Check for required data
     if 'data_path' not in st.session_state:
         st.warning("Please fetch or load data first from the Data Collection page")
@@ -1088,6 +1564,8 @@ def advanced_analysis_page(timestamp):
         if not clustered_path or not os.path.exists(clustered_path):
             # Look for clustered files in the current timestamp directory
             possible_paths = [
+                f"data/processed/{timestamp}/clusters/{file_prefix}_fingerprints_clustered.csv",
+                f"data/processed/{timestamp}/{file_prefix}_fingerprints_clustered.csv",
                 f"data/processed/{timestamp}/clusters/kit_fingerprints_clustered.csv",
                 f"data/processed/{timestamp}/kit_fingerprints_clustered.csv",
                 f"data/processed/{timestamp}/clusters/clustered_data.csv"
@@ -1179,10 +1657,11 @@ def advanced_analysis_page(timestamp):
                             
                             # Determine optimal number of subclusters if auto is selected
                             if n_subclusters == "auto":
-                                clustered_data_file = f"data/processed/{timestamp}/clusters/kit_fingerprints_clustered.csv"
+                                clustered_data_file = clustered_path
+                                target_cluster_value = int(target_cluster) if target_cluster is not None else int(clusters[0])
                                 optimal_subclusters = determine_optimal_subclusters(
                                     clustered_data_file, 
-                                    target_cluster=target_cluster, 
+                                    target_cluster=target_cluster_value,
                                     max_clusters=10
                                 )
                                 st.info(f"🔍 Optimal number of subclusters determined: {optimal_subclusters}")
@@ -1192,7 +1671,8 @@ def advanced_analysis_page(timestamp):
                             subcluster_df = subcluster_analysis(
                                 timestamp=timestamp,
                                 target_cluster=target_cluster, 
-                                n_subclusters=n_subclusters
+                                n_subclusters=n_subclusters,
+                                clustered_data_file=clustered_path,
                             )
                             
                             if subcluster_df is not None:
@@ -1289,173 +1769,737 @@ def advanced_analysis_page(timestamp):
 def small_data_qsar_page(timestamp: str):
     st.header("📊 QSAR Modeling")
     _session_status_bar()
+    file_prefix = _normalize_file_prefix(st.session_state.get("file_prefix", "project"))
     st.markdown(
-        "Train and rigorously validate QSAR models on small datasets ("
-        "< 200 compounds) using PLS, SVM, Random Forest, and XGBoost with "
-        "LOOCV, Repeated K-Fold, and Y-Randomization testing."
+        "Build and validate QSAR models, then screen external blind sets using "
+        "the trained model artifacts (model + scaler + selected features)."
     )
+    def _read_cols_safe(path: str) -> list[str]:
+        try:
+            return pd.read_csv(path, nrows=0).columns.tolist()
+        except Exception:
+            try:
+                return pd.read_csv(path, sep=None, engine="python", nrows=0).columns.tolist()
+            except Exception:
+                return []
 
-    # ── Input dataset ──────────────────────────────────────────────────────
-    st.subheader("1. Input Dataset")
-    col1, col2 = st.columns(2)
-    with col1:
-        # ── Resolve CSV default: session state first, then filesystem scan ──
-        _session_desc = st.session_state.get("descriptors_path") or ""
-        _candidates = [
-            str(_session_desc),  # what's already loaded in this session
+    def _score_training_csv(path: str) -> tuple[int, dict]:
+        cols = _read_cols_safe(path)
+        cols_norm = [str(c).strip().lower() for c in cols]
+        base = os.path.basename(path).lower()
+        has_pic50 = "pic50" in cols_norm
+        has_class = "activity_class" in cols_norm
+        has_smiles = any(c in ["canonical_smiles", "smiles"] for c in cols_norm)
+        has_desc = any(c in cols_norm for c in ["molwt", "mollogp", "tpsa", "ringcount"])
+
+        score = 0
+        score += 4 if has_pic50 else 0
+        score += 4 if has_class else 0
+        score += 2 if has_desc else 0
+        score += 1 if has_smiles else 0
+        score += 2 if "descriptor" in base else 0
+        score += 1 if "fingerprint" in base else 0
+
+        info = {
+            "cols": cols,
+            "has_pic50": has_pic50,
+            "has_class": has_class,
+        }
+        return score, info
+
+    def _score_screening_csv(path: str, required_features: list[str]) -> int:
+        cols = _read_cols_safe(path)
+        if not cols:
+            return -1
+        shared = len([c for c in required_features if c in cols])
+        smiles_bonus = 1 if _find_default_smiles_column(cols) is not None else 0
+        return shared * 10 + smiles_bonus
+
+    # Auto-select best training input if none is selected yet.
+    if not st.session_state.get("qsar_selected_csv_path"):
+        train_candidates = []
+        for p in [
+            st.session_state.get("descriptors_path") or "",
+            st.session_state.get("fingerprints_path") or "",
+            st.session_state.get("data_path") or "",
+            f"data/processed/{timestamp}/{file_prefix}_descriptors_selected.csv",
+            f"data/processed/{timestamp}/{file_prefix}_descriptors.csv",
+            f"data/processed/{timestamp}/{file_prefix}_fingerprints.csv",
             f"data/processed/{timestamp}/kit_descriptors_selected.csv",
             f"data/processed/{timestamp}/kit_descriptors.csv",
             f"data/processed/{timestamp}/chembl_classification_descriptors.csv",
-        ]
-        default_csv = next(
-            (p for p in _candidates if p and os.path.exists(p)),
-            f"data/processed/{timestamp}/kit_descriptors.csv",
-        )
-        csv_path = st.text_input(
-            "Path to CSV with descriptors + target column",
-            value=default_csv,
-            key="qsar_csv_path",
-            help=(
-                "Auto-filled from your session. "
-                "For regression use kit_descriptors.csv (target: pIC50); "
-                "for classification use chembl_classification_descriptors.csv "
-                "(target: activity_class). Run Descriptors & Fingerprints first."
-            ),
-        )
-        # Friendly hint about loaded / available files
-        if _session_desc and os.path.exists(str(_session_desc)):
-            st.caption(f"📌 Loaded from session: `{os.path.basename(str(_session_desc))}`")
-        else:
-            _found = [p for p in _candidates[1:] if os.path.exists(p)]
-            if _found:
-                st.caption("Found on disk: " + "  |  ".join(
-                    os.path.basename(p) for p in _found
-                ))
-            else:
-                st.warning(
-                    f"No descriptor CSV found for project **{timestamp}**. "
-                    "Run the **Descriptors & Fingerprints** page first."
-                )
+            f"data/processed/{timestamp}/chembl_classification_fingerprints.csv",
+        ]:
+            if p and os.path.exists(str(p)):
+                train_candidates.append(str(p))
+        train_candidates.extend(glob.glob(f"data/processed/{timestamp}/*.csv"))
+        train_candidates = sorted(set(train_candidates))
 
-        # ── Auto-detect task and target from the CSV columns ──────────────
-        _detected_task = "regression"
-        _detected_target = "pIC50"
-        _csv_cols: list[str] = []
-        if os.path.exists(csv_path):
-            try:
-                _csv_cols = pd.read_csv(csv_path, nrows=0).columns.tolist()
-                if "activity_class" in _csv_cols:
-                    _detected_task = "classification"
-                    _detected_target = "activity_class"
-                elif "pIC50" in _csv_cols:
-                    _detected_task = "regression"
-                    _detected_target = "pIC50"
-                st.caption(
-                    f"🔍 Auto-detected: **{_detected_task}** · target `{_detected_target}`  "
-                    f"({len(_csv_cols)} columns total)"
-                )
-            except Exception:
-                pass
-
-        task = st.selectbox(
-            "Task",
-            ["regression", "classification"],
-            index=0 if _detected_task == "regression" else 1,
-            # no key= here: Streamlit widget-state cache would override index= above
-        )
-        # If the user manually changed task, allow a manual target override;
-        # otherwise keep the auto-detected target.
-        _default_target = _detected_target if task == _detected_task else (
-            "pIC50" if task == "regression" else "activity_class"
-        )
-        # Validate that the default target actually exists in the file
-        if _csv_cols and _default_target not in _csv_cols:
-            _fallback_targets = [c for c in _csv_cols
-                                  if c not in ["molecule_chembl_id", "canonical_smiles",
-                                               "Smiles", "SMILES"]]
-            _default_target = _fallback_targets[0] if _fallback_targets else _default_target
-            st.warning(
-                f"⚠️ Default target `{_detected_target}` not found in this file. "
-                f"Suggested: `{_default_target}`. Adjust if needed."
+        if train_candidates:
+            ranked = sorted(
+                train_candidates,
+                key=lambda p: _score_training_csv(p)[0],
+                reverse=True,
             )
-        target_col = st.text_input("Target column name", value=_default_target)
-        # no key= here for same reason
-    with col2:
-        n_features = st.number_input("Features to select (RFE, 0 = auto)",
-                                      min_value=0, max_value=500, value=0)
-        optimize_svm = st.checkbox("Grid-search SVM hyperparameters", value=True)
-        y_rand_trials = st.slider("Y-Randomization trials", 20, 200, 100)
-        test_size = st.slider("Test set fraction", 0.1, 0.4, 0.2, 0.05)
+            if ranked and _score_training_csv(ranked[0])[0] > 0:
+                st.session_state["qsar_selected_csv_path"] = ranked[0]
 
-    output_dir = f"models/{timestamp}/small_data_{task}"
+    # Persist task/target across tabs.
+    if "qsar_task" not in st.session_state:
+        st.session_state["qsar_task"] = "regression"
+    if "qsar_target_col" not in st.session_state:
+        st.session_state["qsar_target_col"] = "pIC50"
 
-    # ── Run ────────────────────────────────────────────────────────────────
-    if st.button("▶ Run QSAR Pipeline", type="primary"):
-        if not os.path.exists(csv_path):
-            st.error(f"File not found: {csv_path}")
-            return
-        try:
-            from small_data_qsar import SmallDataQSAR
-            with st.spinner("Running feature selection, model training, and validation…"):
-                qsar = SmallDataQSAR(
-                    task=task,
-                    n_features_to_select=int(n_features) if n_features > 0 else None,
-                    optimize_svm=optimize_svm,
-                    n_y_rand_trials=int(y_rand_trials),
+    tab1, tab2 = st.tabs([
+        "1 · Input Dataset",
+        "2 · Screen Blind Set",
+    ])
+
+    with tab1:
+        st.subheader("Input Dataset and QSAR Training")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if "qsar_pending_csv_path" in st.session_state:
+                st.session_state["qsar_selected_csv_path"] = st.session_state.pop("qsar_pending_csv_path")
+            csv_path = str(st.session_state.get("qsar_selected_csv_path") or "")
+
+            st.text_input(
+                "Training dataset (CSV/TSV)",
+                value=csv_path,
+                key="qsar_selected_csv_path",
+            )
+
+            uploaded_qsar_file = st.file_uploader(
+                "Browse dataset from computer",
+                type=["csv", "tsv", "txt"],
+                key="qsar_external_uploader",
+            )
+            if uploaded_qsar_file is not None:
+                try:
+                    uploads_dir = os.path.join("data", "processed", str(timestamp), "uploads")
+                    os.makedirs(uploads_dir, exist_ok=True)
+
+                    uploaded_name = os.path.basename(str(uploaded_qsar_file.name))
+                    safe_uploaded_name = "".join(
+                        ch if (ch.isalnum() or ch in [".", "_", "-"]) else "_"
+                        for ch in uploaded_name
+                    )
+                    saved_uploaded_path = os.path.join(uploads_dir, safe_uploaded_name)
+                    _cur = str(st.session_state.get("qsar_selected_csv_path") or "")
+                    _pend = str(st.session_state.get("qsar_pending_csv_path") or "")
+                    if saved_uploaded_path not in (_cur, _pend):
+                        with open(saved_uploaded_path, "wb") as saved_file:
+                            saved_file.write(uploaded_qsar_file.getbuffer())
+                        st.session_state["qsar_pending_csv_path"] = saved_uploaded_path
+                        st.success(f"Training dataset loaded: {uploaded_qsar_file.name}")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Error saving uploaded dataset: {str(e)}")
+
+            csv_path = str(st.session_state.get("qsar_selected_csv_path") or "")
+            _csv_cols: list[str] = []
+            _detected_task = "regression"
+            _detected_target = "pIC50"
+
+            if csv_path and os.path.exists(csv_path):
+                try:
+                    _csv_cols = _read_cols_safe(csv_path)
+                    if "activity_class" in _csv_cols:
+                        _detected_task = "classification"
+                        _detected_target = "activity_class"
+                    elif "pIC50" in _csv_cols:
+                        _detected_task = "regression"
+                        _detected_target = "pIC50"
+
+                    st.success(f"✅ Training file ready: {os.path.basename(csv_path)}")
+                    st.caption(
+                        f"Auto-detected: {_detected_task} · target {_detected_target} · "
+                        f"{len(_csv_cols)} columns"
+                    )
+                except Exception as e:
+                    st.error(f"Could not read training file headers: {e}")
+            else:
+                st.info("Select a training file. A best-fitting one is auto-selected when available.")
+
+            st.selectbox(
+                "Task",
+                ["regression", "classification"],
+                key="qsar_task",
+            )
+            st.text_input("Target column name", key="qsar_target_col")
+
+            task = str(st.session_state.get("qsar_task", "regression"))
+            target_col = str(st.session_state.get("qsar_target_col", "pIC50"))
+
+            if _csv_cols:
+                if target_col not in _csv_cols:
+                    st.error(f"Target column '{target_col}' is missing in selected file.")
+                if task == "regression" and "pIC50" not in _csv_cols:
+                    st.warning("Regression usually expects a pIC50 target column.")
+                if task == "classification" and "activity_class" not in _csv_cols:
+                    st.warning("Classification usually expects an activity_class target column.")
+
+            qsar_manual_include_cols: list[str] | None = None
+            qsar_exclude_cols: list[str] = []
+            if _csv_cols:
+                feature_mode = st.radio(
+                    "Feature selection mode",
+                    ["Auto (recommended)", "Manual include list"],
+                    key="qsar_feature_mode",
                 )
-                results = qsar.fit_evaluate(
-                    csv_path, target_col=target_col,
-                    test_size=test_size, output_dir=output_dir
-                )
-            st.success(f"Pipeline complete – results saved to `{output_dir}`")
+                _known_meta = {
+                    "molecule_chembl_id", "canonical_smiles", "Smiles", "SMILES",
+                    "compound_id", "ID", "id", target_col,
+                }
+                # Auto-detect bioassay / metadata columns using the same patterns as
+                # small_data_qsar so training and screening stay in sync.
+                _bioassay_patterns = [
+                    "(nm)", "(um)", "(\u03bcm)", "(pm)", "(mm)",
+                    "nm)", " nm", "_nm",
+                    "ki(", " ki ", "_ki_", "ki_",
+                    "kd(", " kd ", "_kd_", "kd_",
+                    "ec50", "ic50", "inhibition",
+                    "camp", "% at ", "(%) at",
+                    "score", "hac", "notes", "note",
+                    "zincid", "zinc_id",
+                ]
+                def _looks_like_bioassay(col: str) -> bool:
+                    low = col.lower()
+                    return any(p in low for p in _bioassay_patterns)
 
-            # ── Comparison table ──────────────────────────────────────────
-            st.subheader("Model Comparison")
+                default_exclude = [
+                    c for c in _csv_cols
+                    if c in _known_meta or (c != target_col and _looks_like_bioassay(c))
+                ]
+                if default_exclude:
+                    st.caption(
+                        f"⚠️ {len(default_exclude)} column(s) pre-selected for exclusion — "
+                        "assay measurements and metadata can't be reconstructed at screening time."
+                    )
+                qsar_exclude_cols = st.multiselect(
+                    "Columns to exclude",
+                    options=_csv_cols,
+                    default=default_exclude,
+                    key="qsar_exclude_cols",
+                )
+                if feature_mode == "Manual include list":
+                    manual_candidates = [c for c in _csv_cols if c != target_col]
+                    qsar_manual_include_cols = st.multiselect(
+                        "Columns to include as features",
+                        options=manual_candidates,
+                        default=[c for c in manual_candidates if c not in qsar_exclude_cols][:200],
+                        key="qsar_manual_include_cols",
+                    )
+                    if not qsar_manual_include_cols:
+                        st.warning("Select at least one feature column, or switch back to Auto mode.")
+
+        with col2:
+            n_features = st.number_input(
+                "Features to select (RFE, 0 = auto)",
+                min_value=0,
+                max_value=500,
+                value=0,
+                key="qsar_n_features",
+            )
+            optimize_svm = st.checkbox("Grid-search SVM hyperparameters", value=True, key="qsar_optimize_svm")
+            y_rand_trials = st.slider("Y-Randomization trials", 20, 200, 100, key="qsar_y_rand_trials")
+            test_size = st.slider("Test set fraction", 0.1, 0.4, 0.2, 0.05, key="qsar_test_size")
+
+        output_dir = f"models/{timestamp}/small_data_{st.session_state.get('qsar_task', 'regression')}"
+
+        if st.button("▶ Run QSAR Pipeline", type="primary", key="run_qsar_pipeline"):
+            csv_path = str(st.session_state.get("qsar_selected_csv_path") or "")
+            task = str(st.session_state.get("qsar_task", "regression"))
+            target_col = str(st.session_state.get("qsar_target_col", "pIC50"))
+            qsar_manual_include_cols = st.session_state.get("qsar_manual_include_cols")
+            qsar_exclude_cols = st.session_state.get("qsar_exclude_cols", [])
+
+            if not os.path.exists(csv_path):
+                st.error(f"File not found: {csv_path}")
+                return
+            if target_col not in _read_cols_safe(csv_path):
+                st.error(f"Target column '{target_col}' not found in selected file.")
+                return
+
+            try:
+                from small_data_qsar import SmallDataQSAR
+                live_progress_ph = st.empty()
+                live_status_ph = st.empty()
+                live_table_ph = st.empty()
+                progress_bar = live_progress_ph.progress(0.0, text="Starting QSAR pipeline...")
+                live_rows: dict[str, dict] = {}
+
+                def _render_live_rows() -> None:
+                    if not live_rows:
+                        return
+                    live_df = pd.DataFrame(list(live_rows.values()))
+                    if live_df.empty:
+                        return
+                    shown_cols = [c for c in ["Model", "Metric", "Score", "Verdict", "Status"] if c in live_df.columns]
+                    live_table_ph.dataframe(live_df[shown_cols])
+
+                def qsar_progress(update: dict) -> None:
+                    stage = str(update.get("stage", "")).strip().lower()
+                    message = str(update.get("message", "")).strip()
+                    total_models = max(int(update.get("total_models", 1)), 1)
+                    model_index = max(int(update.get("model_index", 0)), 0)
+                    model_name = str(update.get("model_name", "")).strip()
+
+                    if message:
+                        live_status_ph.info(message)
+
+                    frac = 0.02
+                    if stage == "load_complete":
+                        frac = 0.10
+                    elif stage == "feature_selection_start":
+                        frac = 0.20
+                    elif stage == "feature_selection_complete":
+                        frac = 0.35
+                    elif stage == "model_training_start":
+                        frac = 0.40
+                    elif stage == "model_start":
+                        frac = 0.40 + 0.50 * ((max(model_index, 1) - 1) / total_models)
+                    elif stage == "model_complete":
+                        frac = 0.40 + 0.50 * (max(model_index, 1) / total_models)
+                    elif stage == "complete":
+                        frac = 1.00
+
+                    progress_bar.progress(min(max(frac, 0.0), 1.0), text=f"QSAR progress: {stage or 'running'}")
+
+                    if stage == "model_complete" and model_name:
+                        metric_label = "Accuracy" if task == "classification" else "R2"
+                        metric_value = update.get("accuracy", float("nan")) if task == "classification" else update.get("r2", float("nan"))
+                        score_str = f"{float(metric_value):.3f}" if isinstance(metric_value, (int, float)) and np.isfinite(metric_value) else "N/A"
+                        verdict = str(update.get("verdict", "N/A"))
+                        passed = update.get("passed", None)
+                        status = "Pass" if passed is True else ("Fail" if passed is False else "Running")
+
+                        live_rows[model_name] = {
+                            "Model": model_name,
+                            "Metric": metric_label,
+                            "Score": score_str,
+                            "Verdict": verdict,
+                            "Status": status,
+                        }
+                        _render_live_rows()
+
+                with st.spinner("Running feature selection, model training, and validation…"):
+                    qsar = SmallDataQSAR(
+                        task=task,
+                        n_features_to_select=int(n_features) if n_features > 0 else None,
+                        optimize_svm=bool(optimize_svm),
+                        n_y_rand_trials=int(y_rand_trials),
+                    )
+                    results = qsar.fit_evaluate(
+                        csv_path,
+                        target_col=target_col,
+                        include_feature_cols=qsar_manual_include_cols,
+                        exclude_feature_cols=qsar_exclude_cols,
+                        test_size=float(test_size),
+                        output_dir=output_dir,
+                        progress_callback=qsar_progress,
+                    )
+
+                progress_bar.progress(1.0, text="QSAR pipeline complete")
+                st.success(f"Pipeline complete: {output_dir}")
+
+                st.subheader("Model Status")
+                model_names = list(results.keys())
+                if model_names:
+                    status_cols = st.columns(min(3, len(model_names)))
+                    for i, model_name in enumerate(model_names):
+                        m = results.get(model_name, {})
+                        yr = m.get("y_randomization", {})
+                        verdict = str(yr.get("verdict", "N/A"))
+                        passed = yr.get("passed", None)
+                        metric_label = "Accuracy" if task == "classification" else "R2"
+                        metric_value = m.get("accuracy", float("nan")) if task == "classification" else m.get("r2", float("nan"))
+
+                        with status_cols[i % len(status_cols)]:
+                            st.markdown(f"**{model_name}**")
+                            st.metric(metric_label, f"{float(metric_value):.3f}" if isinstance(metric_value, (int, float)) and np.isfinite(metric_value) else "N/A")
+                            if passed is True:
+                                st.success(f"Verdict: {verdict}")
+                            elif passed is False:
+                                st.error(f"Verdict: {verdict}")
+                            else:
+                                st.info(f"Verdict: {verdict}")
+
+                cmp_path = os.path.join(output_dir, "model_comparison.csv")
+                if os.path.exists(cmp_path):
+                    st.subheader("Model Comparison")
+                    st.dataframe(pd.read_csv(cmp_path, index_col=0).round(3))
+
+                st.subheader("Plots")
+                plot_files = sorted(glob.glob(os.path.join(output_dir, "*.png")))
+                if plot_files:
+                    cols = st.columns(min(3, len(plot_files)))
+                    for i, p in enumerate(plot_files):
+                        with cols[i % len(cols)]:
+                            with open(p, "rb") as _f:
+                                st.image(_f.read(), caption=os.path.basename(p), use_container_width=True)
+                else:
+                    st.info("No plots generated yet.")
+
+            except Exception as exc:
+                st.error(f"Error: {exc}")
+
+        elif os.path.isdir(output_dir):
+            st.info(f"Showing results from previous run in {output_dir}")
             cmp_path = os.path.join(output_dir, "model_comparison.csv")
             if os.path.exists(cmp_path):
+                st.subheader("Model Comparison")
                 st.dataframe(pd.read_csv(cmp_path, index_col=0).round(3))
-
-            # ── Y-Randomization verdict ───────────────────────────────────
-            st.subheader("Y-Randomization Results")
-            for model_name, m in results.items():
-                yr = m.get("y_randomization", {})
-                passed = yr.get("passed", None)
-                icon = "✅" if passed else "⚠️"
-                st.write(f"{icon} **{model_name}**: {yr.get('verdict', 'N/A')}  "
-                         f"(true score: `{yr.get('true_score', float('nan')):.3f}`, "
-                         f"rand mean: `{yr.get('rand_mean', float('nan')):.3f}±"
-                         f"{yr.get('rand_std', float('nan')):.3f}`)")
-
-            # ── Plots ─────────────────────────────────────────────────────
-            st.subheader("Plots")
-            plot_files = sorted(glob.glob(os.path.join(output_dir, "*.png")))
-            if plot_files:
-                cols = st.columns(min(3, len(plot_files)))
-                for i, p in enumerate(plot_files):
+            plots = sorted(glob.glob(os.path.join(output_dir, "*.png")))
+            if plots:
+                st.subheader("Plots")
+                cols = st.columns(min(3, len(plots)))
+                for i, p in enumerate(plots):
                     with cols[i % len(cols)]:
                         with open(p, "rb") as _f:
                             st.image(_f.read(), caption=os.path.basename(p), use_container_width=True)
+
+    with tab2:
+        st.subheader("Screening Blind Set")
+        st.caption("Screen with an already trained QSAR model. Input files are checked before prediction.")
+
+        task = str(st.session_state.get("qsar_task", "regression"))
+        output_dir = f"models/{timestamp}/small_data_{task}"
+        default_model_dir = output_dir if os.path.isdir(output_dir) else f"models/{timestamp}/small_data_{task}"
+        screen_out_dir = f"predictions/{timestamp}/qsar_blind_screening"
+
+        if "qsar_screen_model_dir" not in st.session_state:
+            st.session_state["qsar_screen_model_dir"] = default_model_dir
+
+        scr_col1, scr_col2 = st.columns(2)
+        with scr_col1:
+            qsar_screen_model_dir = st.text_input(
+                "Model directory",
+                key="qsar_screen_model_dir",
+                help="Directory containing *_model.pkl, scaler.pkl, and selected_features.txt",
+            )
+
+            available_models = []
+            model_candidates = []
+            if os.path.isdir(qsar_screen_model_dir):
+                model_candidates = sorted(glob.glob(os.path.join(qsar_screen_model_dir, "*_model.pkl")))
+                available_models = [os.path.basename(p).replace("_model.pkl", "") for p in model_candidates]
+
+            if available_models:
+                default_model_name = "random_forest" if "random_forest" in available_models else available_models[0]
             else:
-                st.info("No plots generated yet.")
+                default_model_name = "random_forest" if task == "classification" else "xgboost"
 
-        except Exception as exc:
-            st.error(f"Error: {exc}")
+            qsar_screen_model_name = st.selectbox(
+                "Model type",
+                options=available_models if available_models else [default_model_name],
+                index=(available_models.index(default_model_name) if (available_models and default_model_name in available_models) else 0),
+                key="qsar_screen_model_name",
+            )
 
-    # ── Show existing results ──────────────────────────────────────────────
-    elif os.path.isdir(output_dir):
-        st.info(f"Showing results from previous run in `{output_dir}`")
-        cmp_path = os.path.join(output_dir, "model_comparison.csv")
-        if os.path.exists(cmp_path):
-            st.subheader("Model Comparison")
-            st.dataframe(pd.read_csv(cmp_path, index_col=0).round(3))
-        plots = sorted(glob.glob(os.path.join(output_dir, "*.png")))
-        if plots:
-            st.subheader("Plots")
-            cols = st.columns(min(3, len(plots)))
-            for i, p in enumerate(plots):
-                with cols[i % len(cols)]:
-                    with open(p, "rb") as _f:
-                        st.image(_f.read(), caption=os.path.basename(p), use_container_width=True)
+            if not os.path.isdir(qsar_screen_model_dir):
+                st.error("Model directory does not exist.")
+            elif not available_models:
+                st.warning("No *_model.pkl files found in this model directory.")
+
+        with scr_col2:
+            # Try to auto-pick best blind set for selected model.
+            model_features = []
+            features_txt = os.path.join(qsar_screen_model_dir, "selected_features.txt")
+            if os.path.exists(features_txt):
+                try:
+                    with open(features_txt, "r", encoding="utf-8", errors="replace") as fh:
+                        model_features = [line.strip() for line in fh if line.strip()]
+                except Exception:
+                    model_features = []
+
+            if model_features:
+                st.caption(
+                    f"Model expects {len(model_features)} input features from {os.path.basename(features_txt)}"
+                )
+                st.code("\n".join(str(f) for f in model_features[:12])
+                        + ("\n..." if len(model_features) > 12 else ""))
+
+                _likely_assay_features = []
+                for _f in model_features:
+                    _lf = str(_f).lower()
+                    if (
+                        "(" in _lf
+                        or ")" in _lf
+                        or "%" in _lf
+                        or " " in _lf
+                        or "ec50" in _lf
+                        or "ki" in _lf
+                        or "kd" in _lf
+                        or "inhibition" in _lf
+                    ):
+                        _likely_assay_features.append(_f)
+
+                if _likely_assay_features:
+                    st.warning(
+                        "Selected model appears to be trained on non-structural assay columns "
+                        "(not purely RDKit descriptors/fingerprints). "
+                        "A blind set with only SMILES/descriptors will not satisfy this model."
+                    )
+
+            if not st.session_state.get("qsar_screen_blind_file") and model_features:
+                blind_candidates = []
+                for p in [
+                    st.session_state.get("descriptors_path") or "",
+                    st.session_state.get("fingerprints_path") or "",
+                    st.session_state.get("data_path") or "",
+                    f"data/processed/{timestamp}/{file_prefix}_descriptors_selected.csv",
+                    f"data/processed/{timestamp}/{file_prefix}_descriptors.csv",
+                    f"data/processed/{timestamp}/{file_prefix}_fingerprints.csv",
+                    f"data/processed/{timestamp}/kit_descriptors_selected.csv",
+                    f"data/processed/{timestamp}/kit_descriptors.csv",
+                    "blind_set/blind_set.csv",
+                ]:
+                    if p and os.path.exists(str(p)):
+                        blind_candidates.append(str(p))
+                blind_candidates.extend(glob.glob(f"data/processed/{timestamp}/*.csv"))
+                blind_candidates = sorted(set(blind_candidates))
+                if blind_candidates:
+                    ranked_blind = sorted(
+                        blind_candidates,
+                        key=lambda p: _score_screening_csv(p, model_features),
+                        reverse=True,
+                    )
+                    if ranked_blind and _score_screening_csv(ranked_blind[0], model_features) > 0:
+                        st.session_state["qsar_screen_blind_file"] = ranked_blind[0]
+
+            if "qsar_pending_screen_blind_file" in st.session_state:
+                st.session_state["qsar_screen_blind_file"] = st.session_state.pop("qsar_pending_screen_blind_file")
+
+            st.text_input(
+                "Blind set file (CSV/TSV)",
+                key="qsar_screen_blind_file",
+            )
+
+            uploaded_qsar_blind = st.file_uploader(
+                "Browse blind set from computer",
+                type=["csv", "tsv", "txt"],
+                key="qsar_screen_blind_upload",
+            )
+            if uploaded_qsar_blind is not None:
+                try:
+                    uploads_dir = os.path.join("data", "processed", str(timestamp), "uploads")
+                    os.makedirs(uploads_dir, exist_ok=True)
+                    uploaded_name = os.path.basename(str(uploaded_qsar_blind.name))
+                    safe_uploaded_name = "".join(
+                        ch if (ch.isalnum() or ch in [".", "_", "-"]) else "_"
+                        for ch in uploaded_name
+                    )
+                    saved_upload_path = os.path.join(uploads_dir, safe_uploaded_name)
+                    _cur_blind = str(st.session_state.get("qsar_screen_blind_file") or "")
+                    _pend_blind = str(st.session_state.get("qsar_pending_screen_blind_file") or "")
+                    if saved_upload_path not in (_cur_blind, _pend_blind):
+                        with open(saved_upload_path, "wb") as saved_file:
+                            saved_file.write(uploaded_qsar_blind.getbuffer())
+                        st.session_state["qsar_pending_screen_blind_file"] = saved_upload_path
+                        st.success(f"Blind set loaded: {uploaded_qsar_blind.name}")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Error saving uploaded blind set: {str(e)}")
+
+            qsar_screen_target = st.text_input(
+                "Target class (classification only)",
+                value="1",
+                key="qsar_screen_target_class",
+            )
+            qsar_screen_conf = st.slider(
+                "Confidence threshold (classification)",
+                0.5, 0.99, 0.7, 0.01,
+                key="qsar_screen_confidence",
+            )
+
+        test_n = st.number_input(
+            "Test on first N compounds (0 = full file)",
+            min_value=0,
+            max_value=1_000_000,
+            value=100,
+            step=50,
+            key="qsar_screen_first_n",
+        )
+        st.caption(f"Results file: {screen_out_dir}/all_predictions.csv")
+
+        if st.button("▶ Screen Blind Set", type="primary", key="run_qsar_screen"):
+            qsar_screen_file = str(st.session_state.get("qsar_screen_blind_file") or "")
+            model_path = os.path.join(qsar_screen_model_dir, f"{qsar_screen_model_name}_model.pkl")
+            scaler_path = os.path.join(qsar_screen_model_dir, "scaler.pkl")
+            features_txt = os.path.join(qsar_screen_model_dir, "selected_features.txt")
+            label_encoder_path = os.path.join(qsar_screen_model_dir, "label_encoder.pkl")
+
+            if not os.path.isdir(qsar_screen_model_dir):
+                st.error(f"Model directory not found: {qsar_screen_model_dir}")
+                return
+            if not os.path.exists(qsar_screen_file):
+                st.error(f"Blind set file not found: {qsar_screen_file}")
+                return
+            if not os.path.exists(model_path):
+                st.error(f"Model file not found: {model_path}")
+                return
+            if not os.path.exists(scaler_path):
+                st.error(f"Scaler file not found: {scaler_path}")
+                return
+            if not os.path.exists(features_txt):
+                st.error(f"Feature list not found: {features_txt}")
+                return
+
+            try:
+                import pickle
+
+                with st.spinner("Loading blind set and model artifacts..."):
+                    screen_df = _read_table_with_auto_sep(qsar_screen_file)
+                    if int(test_n) > 0:
+                        screen_df = screen_df.head(int(test_n)).copy()
+
+                    with open(features_txt, "r", encoding="utf-8", errors="replace") as fh:
+                        selected_features = [line.strip() for line in fh if line.strip()]
+
+                    missing_features = [c for c in selected_features if c not in screen_df.columns]
+                    if missing_features:
+                        st.error(
+                            "Blind set is missing required model features. "
+                            f"Missing ({len(missing_features)}): {missing_features[:20]}"
+                        )
+                        st.info(
+                            "Why this happens: predictions use exactly the columns from selected_features.txt "
+                            "saved during training. If those include assay-only columns (e.g., Ki/EC50/Inhibition/score), "
+                            "they cannot be reconstructed from SMILES at screening time."
+                        )
+                        st.info(
+                            "What to do: choose a descriptor-based model directory, retrain QSAR using descriptor/fingerprint "
+                            "features only, or use Classification Pipeline screening which generates descriptors/fingerprints "
+                            "from SMILES automatically."
+                        )
+                        st.caption(f"Model directory: {qsar_screen_model_dir}")
+                        st.caption(f"Feature file: {features_txt}")
+                        return
+
+                    X = screen_df[selected_features].apply(pd.to_numeric, errors="coerce").fillna(0.0).values
+                    with open(scaler_path, "rb") as fh:
+                        scaler = pickle.load(fh)
+                    with open(model_path, "rb") as fh:
+                        model = pickle.load(fh)
+
+                    X_scaled = scaler.transform(X)
+                    y_pred = model.predict(X_scaled)
+
+                    label_encoder = None
+                    if os.path.exists(label_encoder_path):
+                        with open(label_encoder_path, "rb") as fh:
+                            label_encoder = pickle.load(fh)
+
+                    pred_display = label_encoder.inverse_transform(y_pred) if label_encoder is not None else y_pred
+
+                    smiles_col = _find_default_smiles_column(screen_df.columns)
+                    id_col_candidates = [
+                        c for c in screen_df.columns
+                        if str(c).lower() in ["molecule_chembl_id", "compound_id", "id", "mol_id"]
+                    ]
+                    id_col = id_col_candidates[0] if id_col_candidates else None
+
+                    out = pd.DataFrame()
+                    if id_col:
+                        out[id_col] = screen_df[id_col].values
+                    if smiles_col:
+                        out[smiles_col] = screen_df[smiles_col].values
+
+                    if task == "classification":
+                        out["Predicted_Class"] = pred_display
+                        if hasattr(model, "predict_proba"):
+                            probs = model.predict_proba(X_scaled)
+                            if label_encoder is not None and hasattr(label_encoder, "classes_"):
+                                prob_labels = [str(c) for c in label_encoder.classes_]
+                            elif hasattr(model, "classes_"):
+                                prob_labels = [str(c) for c in model.classes_]
+                            else:
+                                prob_labels = [str(i) for i in range(probs.shape[1])]
+
+                            for i, cls_name in enumerate(prob_labels):
+                                out[f"Prob_{cls_name}"] = probs[:, i]
+
+                            target_prob_col = f"Prob_{qsar_screen_target}"
+                            if target_prob_col in out.columns:
+                                out["High_Confidence"] = out[target_prob_col] >= float(qsar_screen_conf)
+                                out = out.sort_values(target_prob_col, ascending=False)
+                    else:
+                        pred_arr = np.asarray(pred_display)
+                        if pred_arr.ndim > 1:
+                            pred_arr = pred_arr.ravel()
+                        out["Predicted_pIC50"] = pred_arr
+                        out = out.sort_values("Predicted_pIC50", ascending=False)
+
+                    os.makedirs(screen_out_dir, exist_ok=True)
+                    out_path = os.path.join(screen_out_dir, "all_predictions.csv")
+                    out.to_csv(out_path, index=False)
+
+                st.success(f"Screening complete. Saved predictions to {out_path}")
+                st.session_state["screening_results_path"] = out_path
+                st.subheader("Preview")
+                st.dataframe(out.head(20))
+
+                with open(out_path, "rb") as fh:
+                    st.download_button(
+                        "⬇ Download all_predictions.csv",
+                        data=fh,
+                        file_name="all_predictions.csv",
+                        mime="text/csv",
+                        key="qsar_download_predictions",
+                    )
+
+                if task == "classification" and "High_Confidence" in out.columns:
+                    target_prob_col = f"Prob_{qsar_screen_target}"
+                    n_hits = int(out["High_Confidence"].sum())
+                    n_total = len(out)
+                    st.info(f"High-confidence hits: {n_hits} / {n_total} at threshold {float(qsar_screen_conf):.2f}")
+
+                    # Predicted class counts (threshold-independent)
+                    if "Predicted_Class" in out.columns:
+                        class_counts = out["Predicted_Class"].value_counts()
+                        st.write("**Predicted class counts (raw, no confidence filter):**")
+                        st.dataframe(class_counts.rename("count").reset_index().rename(columns={"index": "class"}))
+
+                    # Threshold sensitivity table
+                    if target_prob_col in out.columns:
+                        probs = out[target_prob_col]
+                        thresholds = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+                        sens_rows = [
+                            {"Threshold": t, "Hits": int((probs >= t).sum()), "Hit rate (%)": round(100 * (probs >= t).mean(), 3)}
+                            for t in thresholds
+                        ]
+                        st.write("**Threshold sensitivity:**")
+                        st.dataframe(pd.DataFrame(sens_rows))
+
+                        # Probability histogram
+                        import matplotlib
+                        matplotlib.use("Agg")
+                        import matplotlib.pyplot as plt
+                        fig, ax = plt.subplots(figsize=(7, 3))
+                        ax.hist(probs, bins=50, color="steelblue", edgecolor="none")
+                        ax.axvline(float(qsar_screen_conf), color="red", linestyle="--",
+                                   label=f"Current threshold ({float(qsar_screen_conf):.2f})")
+                        ax.set_xlabel(f"Predicted probability (class {qsar_screen_target})")
+                        ax.set_ylabel("Number of compounds")
+                        ax.set_title("Predicted probability distribution")
+                        ax.legend()
+                        fig.tight_layout()
+                        st.pyplot(fig)
+                        plt.close(fig)
+
+                        st.caption(
+                            "**Why so few hits?** A small, imbalanced training set teaches the model to be "
+                            "conservative — most novel compounds fall below 0.7 confidence. "
+                            "The table above shows how many compounds pass at lower thresholds. "
+                            "0.5–0.6 is a common exploratory cut-off when the training set is small."
+                        )
+
+            except Exception as exc:
+                st.error(f"Error during QSAR blind-set screening: {exc}")
+                import traceback
+                st.code(traceback.format_exc())
 
 
 # ---------------------------------------------------------------------------
@@ -1547,6 +2591,8 @@ def predictive_extensions_page(timestamp: str):
             st.session_state.get("descriptors_path") or "",
             f"data/processed/{timestamp}/chembl_classification_descriptors.csv",
             f"data/processed/{timestamp}/chembl_classification_fingerprints.csv",
+            f"data/processed/{timestamp}/{_normalize_file_prefix(st.session_state.get('file_prefix', 'project'))}_descriptors_selected.csv",
+            f"data/processed/{timestamp}/{_normalize_file_prefix(st.session_state.get('file_prefix', 'project'))}_descriptors.csv",
             f"data/processed/{timestamp}/kit_descriptors_selected.csv",
             f"data/processed/{timestamp}/kit_descriptors.csv",
         ]
@@ -1617,8 +2663,12 @@ def predictive_extensions_page(timestamp: str):
                 with col_b:
                     st.metric("Outside AD", outside_n)
 
-                st.subheader("AD-filtered compounds (inside AD)")
-                st.dataframe(df_q[df_q["inside_AD"]].head(50))
+                show_large_dataframe(
+                    df_q[df_q["inside_AD"]],
+                    title="AD-filtered compounds (inside AD)",
+                    max_rows=200,
+                    key_prefix="ad_inside",
+                )
 
                 out_csv = f"predictions/{timestamp}/ad_filtered.csv"
                 os.makedirs(os.path.dirname(out_csv), exist_ok=True)
@@ -1691,19 +2741,23 @@ def predictive_extensions_page(timestamp: str):
                     if cp_task == "classification":
                         from sklearn.preprocessing import LabelEncoder
                         le = LabelEncoder()
-                        y_cal_enc = le.fit_transform(y_cal)
+                        y_cal_enc = le.fit_transform(np.asarray(y_cal))
                     else:
-                        y_cal_enc = y_cal.astype(float)  # type: ignore[assignment]
+                        y_cal_enc = np.asarray(y_cal, dtype=float)
 
                     X_cal_sc = scaler.transform(X_cal)
                     X_q_sc   = scaler.transform(X_q)
 
                     cp_obj = ConformalPredictor(base_model, task=cp_task, alpha=cp_alpha)
-                    cp_obj.calibrate(X_cal_sc, y_cal_enc)
+                    cp_obj.calibrate(np.asarray(X_cal_sc), np.asarray(y_cal_enc))
                     preds = cp_obj.predict(X_q_sc)
 
                 st.success("Conformal prediction complete!")
-                st.dataframe(preds.head(50))
+                show_large_dataframe(
+                    preds,
+                    max_rows=200,
+                    key_prefix="conformal_preds",
+                )
 
                 out_csv = f"predictions/{timestamp}/conformal_predictions.csv"
                 os.makedirs(os.path.dirname(out_csv), exist_ok=True)
@@ -1761,7 +2815,11 @@ def predictive_extensions_page(timestamp: str):
                     else:
                         df_admet = admet.query_pkcsm(smiles_list)
 
-                st.dataframe(df_admet.head(20))
+                show_large_dataframe(
+                    df_admet,
+                    max_rows=200,
+                    key_prefix="admet_raw",
+                )
 
                 # Merge with input and rank
                 df_merged = df_in.merge(df_admet, on=smiles_col_admet, how="left") if smiles_col_admet in df_admet.columns else df_admet
@@ -1774,7 +2832,11 @@ def predictive_extensions_page(timestamp: str):
                         df_merged, qsar_col=qsar_col_admet,
                         admet_cols=admet_extra[:5] if admet_extra else None
                     )
-                    st.dataframe(ranked[[smiles_col_admet, qsar_col_admet, "composite_score"]].head(20))
+                    show_large_dataframe(
+                        ranked[[smiles_col_admet, qsar_col_admet, "composite_score"]],
+                        max_rows=200,
+                        key_prefix="admet_ranked",
+                    )
                     out_csv = f"predictions/{timestamp}/admet_ranked.csv"
                     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
                     ranked.to_csv(out_csv, index=False)
@@ -1867,7 +2929,7 @@ def classification_pipeline_page(timestamp: str) -> None:
     st.header("🧬 Classification Pipeline")
     _session_status_bar()
     st.markdown(
-        "Prepare ChEMBL classification datasets, train binary activity classifiers "
+        "Prepare classification datasets from known compounds, train binary activity classifiers "
         "(RF / XGBoost), and screen a blind set. "
         "Outputs feed directly into **Predictive Extensions** (AD, ADMET, Conformal)."
     )
@@ -1882,29 +2944,33 @@ def classification_pipeline_page(timestamp: str) -> None:
     with tab1:
         st.subheader("Prepare Classification Dataset")
         st.markdown(
-            "Loads `known_compounds/*.csv`, merges IC50 / Ki / Kd / Inhibition "
+            "Loads required CSV files from `known_compounds/`, merges IC50 / Ki / Kd / Inhibition "
             "activity data, assigns binary activity classes, then generates "
             "molecular descriptors or Morgan fingerprints."
+        )
+        st.caption(
+            "Expected files in `known_compounds/`: `chembl_all_class.csv`, `chembl_IC50.csv`, "
+            "`chembl_Ki.csv`, `chembl_Kd.csv`, `chembl_Inhibition.csv`."
         )
 
         kc_dir = "known_compounds"
         required_files = {
-            "chembl_all_class.csv":  os.path.join(kc_dir, "chembl_all_class.csv"),
-            "chembl_IC50.csv":       os.path.join(kc_dir, "chembl_IC50.csv"),
-            "chembl_Ki.csv":         os.path.join(kc_dir, "chembl_Ki.csv"),
-            "chembl_Kd.csv":         os.path.join(kc_dir, "chembl_Kd.csv"),
-            "chembl_Inhibition.csv": os.path.join(kc_dir, "chembl_Inhibition.csv"),
+            "All compounds + class labels": os.path.join(kc_dir, "chembl_all_class.csv"),
+            "IC50 measurements":            os.path.join(kc_dir, "chembl_IC50.csv"),
+            "Ki measurements":              os.path.join(kc_dir, "chembl_Ki.csv"),
+            "Kd measurements":              os.path.join(kc_dir, "chembl_Kd.csv"),
+            "Inhibition measurements":      os.path.join(kc_dir, "chembl_Inhibition.csv"),
         }
 
         col_status, col_cfg = st.columns(2)
         with col_status:
             st.markdown("**Required input files:**")
             all_present = True
-            for fname, fpath in required_files.items():
+            for label, fpath in required_files.items():
                 if os.path.exists(fpath):
-                    st.success(f"✅ {fname}")
+                    st.success(f"✅ {label}: `{os.path.basename(fpath)}`")
                 else:
-                    st.error(f"❌ {fname} — missing!")
+                    st.error(f"❌ {label}: `{os.path.basename(fpath)}` — missing")
                     all_present = False
         with col_cfg:
             feature_type = st.radio(
@@ -1917,7 +2983,7 @@ def classification_pipeline_page(timestamp: str) -> None:
         if not all_present:
             st.warning(
                 "Some source files are missing from `known_compounds/`. "
-                "Ensure all ChEMBL CSV files are present before running."
+                "Ensure all required CSV files are present before running."
             )
 
         # Show what already exists
@@ -1937,7 +3003,7 @@ def classification_pipeline_page(timestamp: str) -> None:
                 import prepare_and_train_classification as pat
                 pat.timestamp = timestamp  # point module at current project
 
-                with st.spinner("Loading and merging ChEMBL data…"):
+                with st.spinner("Loading and merging classification source data…"):
                     merged_df = pat.load_and_merge_data(kc_dir)
                     _out_dir = f"data/processed/{timestamp}"
                     os.makedirs(_out_dir, exist_ok=True)
@@ -2080,6 +3146,27 @@ def classification_pipeline_page(timestamp: str) -> None:
                                 st.error(f"Error training {label}: {exc}")
 
                     if trained:
+                        st.subheader("Model Status")
+                        trained_names = list(trained.keys())
+                        status_cols = st.columns(min(3, len(trained_names)))
+                        for i, label in enumerate(trained_names):
+                            m = trained.get(label, {})
+                            acc = m.get("accuracy", float("nan"))
+                            auc = m.get("auc_roc", float("nan"))
+
+                            with status_cols[i % len(status_cols)]:
+                                st.markdown(f"**{label}**")
+                                if isinstance(acc, (int, float)) and np.isfinite(acc):
+                                    st.metric("Accuracy", f"{float(acc):.3f}")
+                                else:
+                                    st.metric("Accuracy", "N/A")
+
+                                if isinstance(auc, (int, float)) and np.isfinite(auc):
+                                    verdict = "Good" if float(auc) >= 0.75 else "Review"
+                                    st.caption(f"Verdict: {verdict} (AUC={float(auc):.3f})")
+                                else:
+                                    st.caption("Verdict: N/A")
+
                         st.subheader("Model Comparison")
                         cmp_df = pd.DataFrame(trained).T.round(3)
                         st.dataframe(cmp_df)
@@ -2114,6 +3201,9 @@ def classification_pipeline_page(timestamp: str) -> None:
             "The output `all_predictions.csv` feeds directly into "
             "**Predictive Extensions → ADMET Scoring** and **Applicability Domain**."
         )
+        st.caption(
+            "Auto-filled paths are defaults only. You can change them manually or upload a blind-set file."
+        )
 
         _default_model_dir = (
             st.session_state.get("classification_model_dir")
@@ -2127,15 +3217,24 @@ def classification_pipeline_page(timestamp: str) -> None:
                 value=_default_model_dir,
                 key="screen_model_dir",
             )
-            _pkl_files = sorted(glob.glob(f"{screen_model_dir}/*.pkl")) \
-                if os.path.isdir(screen_model_dir) else []
+            _model_file_patterns = [
+                os.path.join(screen_model_dir, "*_classifier.pkl"),
+                os.path.join(screen_model_dir, "*_model.pkl"),
+            ]
+            _pkl_files = []
+            if os.path.isdir(screen_model_dir):
+                for _pat in _model_file_patterns:
+                    _pkl_files.extend(glob.glob(_pat))
+            _pkl_files = sorted(set(_pkl_files))
             _model_opts = [
                 os.path.basename(f).replace("_classifier.pkl", "").replace("_model.pkl", "")
                 for f in _pkl_files
-            ] or ["xgb", "rf"]
+            ] or ["xgb", "rf", "random_forest"]
             screen_model_type = st.selectbox(
                 "Model type", _model_opts, key="screen_model_type"
             )
+            if not _pkl_files and os.path.isdir(screen_model_dir):
+                st.warning("No model files found in this directory. Expected `*_classifier.pkl` or `*_model.pkl`.")
 
         with col2:
             screen_blind_file = st.text_input(
@@ -2143,6 +3242,27 @@ def classification_pipeline_page(timestamp: str) -> None:
                 value=st.session_state.get("data_path") or "blind_set/blind_set.csv",
                 key="screen_blind_file",
             )
+            uploaded_blind_file = st.file_uploader(
+                "Or upload blind set from computer",
+                type=["csv", "tsv", "txt"],
+                key="screen_blind_upload",
+            )
+            if uploaded_blind_file is not None:
+                st.success(f"Loaded file: {uploaded_blind_file.name}")
+                if st.button("Use Uploaded Blind Set", key="use_uploaded_blind_set"):
+                    uploads_dir = os.path.join("data", "processed", str(timestamp), "uploads")
+                    os.makedirs(uploads_dir, exist_ok=True)
+                    uploaded_name = os.path.basename(str(uploaded_blind_file.name))
+                    safe_uploaded_name = "".join(
+                        ch if (ch.isalnum() or ch in [".", "_", "-"]) else "_"
+                        for ch in uploaded_name
+                    )
+                    saved_blind_path = os.path.join(uploads_dir, safe_uploaded_name)
+                    with open(saved_blind_path, "wb") as saved_file:
+                        saved_file.write(uploaded_blind_file.getbuffer())
+                    st.session_state["screen_blind_file"] = saved_blind_path
+                    st.session_state["_load_banner"] = f"Blind set loaded: {uploaded_blind_file.name}"
+                    st.rerun()
             screen_target_class = st.text_input(
                 "Target class label (active compounds)",
                 value="1",
@@ -2182,7 +3302,7 @@ def classification_pipeline_page(timestamp: str) -> None:
 
                     with st.spinner(f"Loading `{screen_model_type}` classifier…"):
                         classifier = load_classifier(
-                            screen_model_dir, model_type=screen_model_type
+                            screen_model_dir, model_type=str(screen_model_type or "")
                         )
                     st.success("✅ Classifier loaded")
 
@@ -2247,6 +3367,7 @@ def classification_pipeline_page(timestamp: str) -> None:
 def main():
     # Get sidebar components
     timestamp, chembl_id, page = sidebar_components()
+    timestamp = str(timestamp or datetime.now().strftime("%Y%m%d"))
     
     # Display selected page
     if page == "Data Collection":
@@ -2259,8 +3380,13 @@ def main():
         advanced_analysis_page(timestamp)
     elif page == "QSAR Modeling":
         small_data_qsar_page(timestamp)
-    elif page == "Classification Pipeline":
-        classification_pipeline_page(timestamp)
+    elif page == "Classification Pipeline 🚧":
+        st.header("🧬 Classification Pipeline")
+        st.warning("🚧 Under Construction")
+        st.info(
+            "This page is temporarily disabled while it is being redesigned. "
+            "Use **QSAR Modeling** for classification training and screening in the meantime."
+        )
     elif page == "Predictive Extensions":
         predictive_extensions_page(timestamp)
 

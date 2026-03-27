@@ -1,9 +1,21 @@
 # Data files
-data/processed/*/
+data/
 *.csv
 *.pkl
 *.png
 *.html
+*.sdf
+*.smi
+*.mol2
+*.pdb
+
+# Results & models
+blind_set/
+cross_val_docking/
+docking_results/
+known_compounds/
+models/
+predictions/
 
 # Private folders
 books/

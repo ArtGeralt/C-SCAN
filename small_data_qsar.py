@@ -31,18 +31,22 @@ import os
 import pickle
 import warnings
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
+
+import multiprocessing
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 import seaborn as sns
 
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.feature_selection import RFE, VarianceThreshold
+from sklearn.base import clone
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -79,18 +83,98 @@ _EXCLUDE_COLS = [
     "IC50_pActivity", "Kd_pActivity", "Ki_pActivity", "Inhibition_percent",
 ]
 
+# Patterns that identify biological-assay or metadata columns that should NEVER
+# become model features (they are unavailable for virtual screening hits).
+_BIOASSAY_PATTERNS = [
+    # assay unit suffixes / substrings
+    "(nm)", "(um)", "(μm)", "(pm)", "(mm)",
+    "nm)", " nm", "_nm",
+    # assay type keywords
+    "ki(", " ki ", "_ki_", "ki_",
+    "kd(", " kd ", "_kd_", "kd_",
+    "ec50", "ic50", "ki(", "inhibition",
+    "camp", "% at ", "(%) at",
+    # docking / metadata columns
+    "score", "hac", "notes", "note",
+    "zincid", "zinc_id", "zinc id",
+]
 
-def _load_xy(csv_path: str, target_col: str):
+
+def _is_bioassay_col(name: str) -> bool:
+    """Return True if the column name looks like a biological assay or metadata column.
+
+    These columns cannot be computed from SMILES at screening time, so they must
+    never enter the feature matrix.
+    """
+    low = name.lower()
+    return any(pat in low for pat in _BIOASSAY_PATTERNS)
+
+
+def _load_xy(
+    csv_path: str,
+    target_col: str,
+    include_feature_cols: list[str] | None = None,
+    exclude_feature_cols: list[str] | None = None,
+):
     """Load a CSV and split into feature matrix X and target y."""
     df = pd.read_csv(csv_path)
     if target_col not in df.columns:
         raise ValueError(f"Target column '{target_col}' not found. "
                          f"Available: {df.columns.tolist()}")
-    exclude = [c for c in _EXCLUDE_COLS if c in df.columns]
-    if target_col not in exclude:
-        exclude.append(target_col)
-    feature_cols = [c for c in df.columns if c not in exclude]
-    X = df[feature_cols].values.astype(float)
+
+    if include_feature_cols:
+        missing = [c for c in include_feature_cols if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Included feature columns not found: {missing}. "
+                f"Available: {df.columns.tolist()}"
+            )
+        feature_cols = [c for c in include_feature_cols if c != target_col]
+    else:
+        exclude = [c for c in _EXCLUDE_COLS if c in df.columns]
+        if exclude_feature_cols:
+            exclude.extend([c for c in exclude_feature_cols if c in df.columns])
+        if target_col not in exclude:
+            exclude.append(target_col)
+        # Auto-drop bioassay / metadata columns that can't be computed from SMILES
+        bioassay_auto = [
+            c for c in df.columns
+            if c not in exclude and _is_bioassay_col(c)
+        ]
+        if bioassay_auto:
+            print(
+                f"  [_load_xy] Auto-excluding {len(bioassay_auto)} bioassay/metadata columns "
+                f"(not computable from SMILES): {bioassay_auto}"
+            )
+            exclude.extend(bioassay_auto)
+        feature_cols = [c for c in df.columns if c not in exclude]
+
+    if not feature_cols:
+        raise ValueError(
+            "No feature columns selected. Provide include_feature_cols or reduce excluded columns."
+        )
+
+    feature_df = df[feature_cols].apply(pd.to_numeric, errors="coerce")
+    dropped_non_numeric = [
+        col for col in feature_df.columns
+        if feature_df[col].notna().sum() == 0
+    ]
+    if dropped_non_numeric:
+        print(
+            f"  [_load_xy] Dropping {len(dropped_non_numeric)} fully non-numeric columns: "
+            f"{dropped_non_numeric[:10]}"
+        )
+        feature_df = feature_df.drop(columns=dropped_non_numeric)
+
+    if feature_df.shape[1] == 0:
+        raise ValueError(
+            "No numeric feature columns remained after parsing. "
+            "Remove ID/text columns (e.g., ZINC IDs) or provide descriptor/fingerprint columns only."
+        )
+
+    feature_df = feature_df.fillna(0.0)
+    feature_cols = feature_df.columns.tolist()
+    X = feature_df.values.astype(float)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     return X, df[target_col].values, feature_cols, df
 
@@ -196,7 +280,7 @@ def loocv_score(model, X: np.ndarray, y: np.ndarray, task: str = "regression") -
     Returns Q²/accuracy plus raw CV predictions.
     """
     loo = LeaveOneOut()
-    y_cv = cross_val_predict(model, X, y, cv=loo)
+    y_cv = cross_val_predict(model, X, y, cv=loo, n_jobs=-1)
 
     if task == "regression":
         ss_res = float(np.sum((y - y_cv) ** 2))
@@ -252,15 +336,46 @@ def y_randomization_test(
     Returns a dict with randomized scores and a pass/fail verdict.
     """
     rng = np.random.default_rng(42)
-    scoring = "r2" if task == "regression" else "f1_weighted"
-    rand_scores = []
+    # For classification use balanced_accuracy instead of f1_weighted.
+    # f1_weighted on imbalanced data gives misleadingly high scores to random
+    # shuffles (a model that always predicts the majority class scores ~0.7+),
+    # causing genuine models to fail the Y-rand test.
+    # balanced_accuracy = 0.50 for any majority-class-only predictor, making
+    # the signal/noise separation robust to class imbalance.
+    scoring = "r2" if task == "regression" else "balanced_accuracy"
+    n_samples = X.shape[0]
 
-    for _ in range(n_trials):
-        y_shuffled = rng.permutation(y)
-        s = cross_val_score(model, X, y_shuffled, cv=cv, scoring=scoring, n_jobs=-1).mean()
-        rand_scores.append(float(s))
+    # Adaptive caps for large datasets to keep runtime bounded
+    effective_trials = n_trials
+    if n_samples >= 100000:
+        effective_trials = min(n_trials, 20)
+    elif n_samples >= 10000:
+        effective_trials = min(n_trials, 40)
+    elif n_samples >= 2000:
+        effective_trials = min(n_trials, 60)
 
-    # True model score
+    if effective_trials != n_trials:
+        print(
+            f"  Large dataset mode: reducing Y-randomization trials "
+            f"from {n_trials} to {effective_trials}."
+        )
+
+    # Generate per-trial seeds up-front for reproducibility
+    seeds = rng.integers(0, 2**31, size=effective_trials).tolist()
+
+    def _single_trial(seed: int) -> float:
+        _rng = np.random.default_rng(seed)
+        y_shuffled = _rng.permutation(y)
+        # Use n_jobs=1 here: the outer Parallel already fills the cores
+        return float(cross_val_score(clone(model), X, y_shuffled, cv=cv,
+                                     scoring=scoring, n_jobs=1).mean())
+
+    n_parallel = min(effective_trials, multiprocessing.cpu_count())
+    rand_scores = Parallel(n_jobs=n_parallel, backend="loky")(
+        delayed(_single_trial)(s) for s in seeds
+    )
+
+    # True model score (uses all cores for CV)
     true_score = float(cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=-1).mean())
     rand_mean = float(np.mean(rand_scores))
     rand_std  = float(np.std(rand_scores))
@@ -268,9 +383,9 @@ def y_randomization_test(
     # Verdict: true model must be > mean + 2*std of randomized
     passed = true_score > (rand_mean + 2 * rand_std)
     verdict = "PASS" if passed else "FAIL (possible chance correlation)"
-    metric_label = "R²" if task == "regression" else "F1"
+    metric_label = "R²" if task == "regression" else "Balanced-Acc"
 
-    print(f"\n  Y-Randomization test ({n_trials} trials):")
+    print(f"\n  Y-Randomization test ({effective_trials} trials):")
     print(f"    True model {metric_label}         = {true_score:.3f}")
     print(f"    Randomized {metric_label} (mean)  = {rand_mean:.3f} ± {rand_std:.3f}")
     print(f"    Verdict: {verdict}")
@@ -280,6 +395,7 @@ def y_randomization_test(
         "rand_mean": rand_mean,
         "rand_std": rand_std,
         "rand_scores": rand_scores,
+        "n_trials_effective": effective_trials,
         "passed": passed,
         "verdict": verdict,
     }
@@ -296,7 +412,7 @@ def _build_pls(X_train, y_train, max_components: int = 10) -> PLSRegression:
     for n in range(1, n_max + 1):
         pls = PLSRegression(n_components=n, max_iter=1000)
         loo = LeaveOneOut()
-        y_cv = cross_val_predict(pls, X_train, y_train, cv=loo)
+        y_cv = cross_val_predict(pls, X_train, y_train, cv=loo, n_jobs=-1)
         ss_res = float(np.sum((y_train - y_cv) ** 2))
         ss_tot = float(np.sum((y_train - y_train.mean()) ** 2))
         q2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else -np.inf
@@ -327,9 +443,13 @@ def _build_svm(X_train, y_train, task: str = "regression", optimize: bool = True
     else:
         param_grid2: dict[str, list] = {"C": [0.1, 1, 10, 100], "gamma": ["scale", "auto", 0.01, 0.001]}
         scoring2 = "f1_weighted"
+        y_train_arr = np.asarray(y_train)
+        class_counts = pd.Series(y_train_arr).value_counts()
+        min_class_count = int(class_counts.min()) if not class_counts.empty else 0
+        cv_cls = max(2, min(5, min_class_count)) if min_class_count >= 2 else 2
         if optimize:
             gs2 = GridSearchCV(SVC(kernel="rbf", probability=True), param_grid2,
-                               cv=min(5, len(y_train)), scoring=scoring2, n_jobs=-1)
+                               cv=cv_cls, scoring=scoring2, n_jobs=-1)
             gs2.fit(X_train, y_train)
             print(f"  SVM best params: {gs2.best_params_}")
             return gs2.best_estimator_
@@ -439,8 +559,11 @@ class SmallDataQSAR:
         self,
         csv_path: str,
         target_col: str = "pIC50",
+        include_feature_cols: list[str] | None = None,
+        exclude_feature_cols: list[str] | None = None,
         test_size: float = 0.2,
         output_dir: str | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict:
         """
         Full pipeline: load → feature selection → train multiple models →
@@ -452,16 +575,62 @@ class SmallDataQSAR:
             output_dir = f"models/{timestamp}/small_data_{self.task}"
         os.makedirs(output_dir, exist_ok=True)
 
+        def _emit(update: dict[str, Any]) -> None:
+            if progress_callback is not None:
+                try:
+                    progress_callback(update)
+                except Exception:
+                    # Progress updates must never interrupt training.
+                    pass
+
         # ---- Load data ----
-        X_raw, y_raw, feature_names, df = _load_xy(csv_path, target_col)
+        X_raw, y_raw, feature_names, df = _load_xy(
+            csv_path,
+            target_col,
+            include_feature_cols=include_feature_cols,
+            exclude_feature_cols=exclude_feature_cols,
+        )
+        _emit({
+            "stage": "load_complete",
+            "message": "Dataset loaded",
+            "n_samples": int(X_raw.shape[0]),
+            "n_features": int(X_raw.shape[1]),
+        })
         print(f"\n{'='*70}")
         print(f"  SmallDataQSAR  task={self.task}  n={X_raw.shape[0]}  p={X_raw.shape[1]}")
         print(f"{'='*70}")
 
         # ---- Encode labels for classification ----
         if self.task == "classification":
+            y_series = pd.Series(y_raw).astype(str).str.strip()
+            invalid_tokens = {"", "nan", "none", "null"}
+            y_series = y_series[~y_series.str.lower().isin(invalid_tokens)]
+
+            class_counts_raw = y_series.value_counts()
+            rare_classes = class_counts_raw[class_counts_raw < 2].index.tolist()
+
+            valid_mask = y_series.index
+            if rare_classes:
+                keep_mask = ~y_series.isin(rare_classes)
+                dropped_n = int((~keep_mask).sum())
+                print(
+                    "  Classification cleanup: dropping rare classes with <2 samples: "
+                    f"{rare_classes} (removed {dropped_n} rows)"
+                )
+                valid_mask = y_series[keep_mask].index
+                y_series = y_series.loc[valid_mask]
+
+            X_raw = X_raw[valid_mask]
+            df = df.iloc[valid_mask].copy()
+
+            if y_series.nunique() < 2:
+                raise ValueError(
+                    "After removing rare/invalid labels, fewer than 2 classes remain. "
+                    "Please keep only well-represented classes (e.g., 0/1)."
+                )
+
             self.label_encoder_ = LabelEncoder()
-            y: np.ndarray = np.asarray(self.label_encoder_.fit_transform(np.asarray(y_raw)))
+            y: np.ndarray = np.asarray(self.label_encoder_.fit_transform(np.asarray(y_series)))
             print(f"  Classes: {dict(zip(self.label_encoder_.classes_, range(len(self.label_encoder_.classes_))))}")
         else:
             y = np.asarray(y_raw, dtype=float)
@@ -476,6 +645,7 @@ class SmallDataQSAR:
 
         # ---- Feature selection (on training data only) ----
         print("\n[Step 1] Feature Selection")
+        _emit({"stage": "feature_selection_start", "message": "Running feature selection"})
         self.selector_ = FeatureSelector(
             n_features=self.n_features_to_select,
             task=self.task,
@@ -483,6 +653,11 @@ class SmallDataQSAR:
         X_tr_sel = self.selector_.fit(X_tr, y_tr, feature_names)
         X_te_sel = self.selector_.transform(X_te)
         sel_names = self.selector_.selected_names_
+        _emit({
+            "stage": "feature_selection_complete",
+            "message": "Feature selection complete",
+            "selected_features": int(len(sel_names)),
+        })
 
         # Save selected feature names
         with open(os.path.join(output_dir, "selected_features.txt"), "w") as fh:
@@ -499,13 +674,22 @@ class SmallDataQSAR:
 
         # ---- Train models ----
         print("\n[Step 2] Model Training")
+        _emit({"stage": "model_training_start", "message": "Training models"})
         model_configs = self._build_models(X_tr_sc, y_tr)
+        total_models = len(model_configs)
 
         all_results: dict[str, dict] = {}
 
-        for name, model in model_configs.items():
+        for model_idx, (name, model) in enumerate(model_configs.items(), start=1):
             print(f"\n  --- {name} ---")
             prefix = name.lower().replace(" ", "_")
+            _emit({
+                "stage": "model_start",
+                "message": f"Training {name}",
+                "model_name": name,
+                "model_index": model_idx,
+                "total_models": total_models,
+            })
 
             # --- Hold-out evaluation ---
             y_pred = model.predict(X_te_sc)
@@ -560,13 +744,32 @@ class SmallDataQSAR:
                 metrics["feature_importances"] = dict(zip(sel_names, imp.tolist()))
 
             # --- LOOCV ---
-            print(f"  Running LOOCV…")
-            loocv_res = loocv_score(model, X_full_sc, y, task=self.task)
-            metrics["loocv"] = {k: v for k, v in loocv_res.items() if k != "y_cv"}
+            if len(y) <= 2000:
+                print("  Running LOOCV...")
+                loocv_res = loocv_score(model, X_full_sc, y, task=self.task)
+                metrics["loocv"] = {k: v for k, v in loocv_res.items() if k != "y_cv"}
+            else:
+                print("  Skipping LOOCV for large dataset (n > 2000).")
+                metrics["loocv"] = {"skipped": True}
 
             # --- Repeated K-Fold ---
             print(f"  Running Repeated K-Fold…")
-            n_splits = min(5, max(2, len(y) // 5))
+            if self.task == "classification":
+                min_class_count_cv = int(pd.Series(y).value_counts().min())
+                if len(y) >= 100000:
+                    base_splits = 3
+                elif len(y) >= 10000:
+                    base_splits = 4
+                else:
+                    base_splits = min(5, max(2, len(y) // 5))
+                n_splits = max(2, min(base_splits, min_class_count_cv))
+            else:
+                if len(y) >= 100000:
+                    n_splits = 3
+                elif len(y) >= 10000:
+                    n_splits = 4
+                else:
+                    n_splits = min(5, max(2, len(y) // 5))
             rkf_res = repeated_kfold_score(model, X_full_sc, y,
                                            n_splits=n_splits, task=self.task)
             metrics["repeated_kfold"] = rkf_res
@@ -578,6 +781,19 @@ class SmallDataQSAR:
                                              task=self.task, cv=n_splits)
             metrics["y_randomization"] = yrand_res
             _plot_y_rand(yrand_res, self.task, output_dir, prefix)
+
+            _emit({
+                "stage": "model_complete",
+                "message": f"Completed {name}",
+                "model_name": name,
+                "model_index": model_idx,
+                "total_models": total_models,
+                "task": self.task,
+                "accuracy": float(metrics.get("accuracy", float("nan"))),
+                "r2": float(metrics.get("r2", float("nan"))),
+                "verdict": str(yrand_res.get("verdict", "N/A")),
+                "passed": yrand_res.get("passed", None),
+            })
 
             all_results[name] = metrics
             self.models_[name] = model
@@ -592,13 +808,31 @@ class SmallDataQSAR:
         with open(os.path.join(output_dir, "scaler.pkl"), "wb") as fh:
             pickle.dump(self.scaler_, fh)
         with open(os.path.join(output_dir, "feature_selector.pkl"), "wb") as fh:
-            pickle.dump(self.selector_, fh)
+            _sel_idx = getattr(self.selector_, "selected_indices_", None)
+            if isinstance(_sel_idx, np.ndarray):
+                _sel_idx_list = _sel_idx.tolist()
+            elif _sel_idx is None:
+                _sel_idx_list = []
+            else:
+                _sel_idx_list = list(_sel_idx)
+
+            selector_state = {
+                "variance_threshold": getattr(self.selector_, "variance_threshold", None),
+                "correlation_threshold": getattr(self.selector_, "correlation_threshold", None),
+                "n_features": getattr(self.selector_, "n_features", None),
+                "rfe_estimator": getattr(self.selector_, "rfe_estimator", None),
+                "task": getattr(self.selector_, "task", None),
+                "selected_indices": _sel_idx_list,
+                "selected_names": list(getattr(self.selector_, "selected_names_", []) or []),
+            }
+            pickle.dump(selector_state, fh)
         if self.label_encoder_:
             with open(os.path.join(output_dir, "label_encoder.pkl"), "wb") as fh:
                 pickle.dump(self.label_encoder_, fh)
 
         # ---- Comparison table ----
         self._print_summary(all_results, output_dir)
+        _emit({"stage": "complete", "message": "QSAR pipeline complete"})
 
         return all_results
 
@@ -629,7 +863,7 @@ class SmallDataQSAR:
                                subsample=0.8, colsample_bytree=0.8,
                                reg_alpha=1.0, reg_lambda=5.0,
                                random_state=42, n_jobs=-1, eval_metric="rmse",
-                               verbosity=0)
+                               tree_method="hist", verbosity=0)
             xgb.fit(X_tr, y_tr)
             models["XGBoost"] = xgb
 
@@ -652,7 +886,7 @@ class SmallDataQSAR:
                                 subsample=0.8, colsample_bytree=0.8,
                                 reg_alpha=1.0, reg_lambda=5.0,
                                 random_state=42, n_jobs=-1, eval_metric="logloss",
-                                verbosity=0)
+                                tree_method="hist", verbosity=0)
             xgb.fit(X_tr, y_tr)
             models["XGBoost"] = xgb
 

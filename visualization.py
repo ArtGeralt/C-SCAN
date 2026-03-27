@@ -566,19 +566,37 @@ def chemical_space_visualization(data_path, output_dir=None):
     pca = PCA(n_components=min(50, X_scaled.shape[1], X_scaled.shape[0]))
     X_pca = pca.fit_transform(X_scaled)
     
-    # t-SNE for final visualization
-    tsne = TSNE(n_components=2, random_state=42)
-    X_tsne = tsne.fit_transform(X_pca)
+    # t-SNE for final visualization (sample for very large datasets)
+    max_tsne_points = 10000
+    if len(X_pca) > max_tsne_points:
+        rng = np.random.default_rng(42)
+        vis_idx = rng.choice(len(X_pca), size=max_tsne_points, replace=False)
+        print(f"t-SNE sampling enabled: {max_tsne_points}/{len(X_pca)} compounds")
+    else:
+        vis_idx = np.arange(len(X_pca))
+
+    X_pca_vis = X_pca[vis_idx]
+    perplexity = max(5, min(50, (len(X_pca_vis) - 1) // 3))
+    tsne = TSNE(
+        n_components=2,
+        random_state=42,
+        init='pca',
+        learning_rate='auto',
+        method='barnes_hut',
+        angle=0.5,
+        perplexity=perplexity,
+    )
+    X_tsne = tsne.fit_transform(X_pca_vis)
     
     # Create visualization DataFrame
     vis_df = pd.DataFrame({
         'TSNE1': X_tsne[:, 0],
         'TSNE2': X_tsne[:, 1],
-        'pIC50': df['pIC50']
+        'pIC50': df['pIC50'].iloc[vis_idx].values
     })
     
     if 'cluster' in df.columns:
-        vis_df['cluster'] = df['cluster']
+        vis_df['cluster'] = df['cluster'].iloc[vis_idx].values
     
     # Plot t-SNE visualization
     plt.figure(figsize=(16, 7))
@@ -591,9 +609,25 @@ def chemical_space_visualization(data_path, output_dir=None):
         
         plt.subplot(1, 2, 2)
     
-    scatter = sns.scatterplot(x='TSNE1', y='TSNE2', hue='pIC50', palette='coolwarm', data=vis_df)
-    plt.title('Chemical Space by Activity (pIC50)')
-    plt.colorbar(scatter.collections[0], label='pIC50')
+    pic50_vals = pd.to_numeric(vis_df['pIC50'], errors='coerce').to_numpy()
+    valid_mask = np.isfinite(pic50_vals)
+    if valid_mask.any():
+        sc = plt.scatter(
+            vis_df.loc[valid_mask, 'TSNE1'],
+            vis_df.loc[valid_mask, 'TSNE2'],
+            c=pic50_vals[valid_mask],
+            cmap='coolwarm',
+            s=20,
+            alpha=0.8,
+            edgecolors='none',
+        )
+        plt.title('Chemical Space by Activity (pIC50)')
+        plt.colorbar(sc, label='pIC50')
+    else:
+        sns.scatterplot(x='TSNE1', y='TSNE2', hue='cluster', palette='viridis', data=vis_df, legend=False)
+        plt.title('Chemical Space by Activity (pIC50 unavailable)')
+        plt.text(0.5, 0.02, 'No valid pIC50 values found', transform=plt.gca().transAxes,
+                 ha='center', va='bottom', fontsize=9)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "chemical_space.png"))
@@ -607,7 +641,8 @@ def chemical_space_visualization(data_path, output_dir=None):
         
         # Filter visualization dataframe
         cluster_vis_df = vis_df[vis_df['cluster'] == largest_cluster].copy()
-        cluster_vis_df['subcluster'] = df[df['cluster'] == largest_cluster]['subcluster'].values
+        full_cluster_df = df.iloc[vis_idx][df.iloc[vis_idx]['cluster'] == largest_cluster]
+        cluster_vis_df['subcluster'] = full_cluster_df['subcluster'].values
         
         # Plot
         plt.figure(figsize=(16, 7))
@@ -618,9 +653,25 @@ def chemical_space_visualization(data_path, output_dir=None):
         plt.legend(title='Subcluster')
         
         plt.subplot(1, 2, 2)
-        scatter = sns.scatterplot(x='TSNE1', y='TSNE2', hue='pIC50', palette='coolwarm', data=cluster_vis_df)
-        plt.title(f'Cluster {largest_cluster} Activity Distribution')
-        plt.colorbar(scatter.collections[0], label='pIC50')
+        cluster_pic50 = pd.to_numeric(cluster_vis_df['pIC50'], errors='coerce').to_numpy()
+        cluster_valid = np.isfinite(cluster_pic50)
+        if cluster_valid.any():
+            sc2 = plt.scatter(
+                cluster_vis_df.loc[cluster_valid, 'TSNE1'],
+                cluster_vis_df.loc[cluster_valid, 'TSNE2'],
+                c=cluster_pic50[cluster_valid],
+                cmap='coolwarm',
+                s=20,
+                alpha=0.8,
+                edgecolors='none',
+            )
+            plt.title(f'Cluster {largest_cluster} Activity Distribution')
+            plt.colorbar(sc2, label='pIC50')
+        else:
+            sns.scatterplot(x='TSNE1', y='TSNE2', hue='subcluster', palette='tab10', data=cluster_vis_df, legend=False)
+            plt.title(f'Cluster {largest_cluster} Activity Distribution (pIC50 unavailable)')
+            plt.text(0.5, 0.02, 'No valid pIC50 values found', transform=plt.gca().transAxes,
+                     ha='center', va='bottom', fontsize=9)
         
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, f"cluster_{largest_cluster}_subclusters.png"))

@@ -49,6 +49,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+from sklearn.utils import check_random_state
 
 from sklearn.base import clone
 from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
@@ -81,12 +82,19 @@ class ApplicabilityDomain:
         method: str = "tanimoto",
         threshold: float = 0.4,
         k: int = 5,
+        max_train_reference: int = 10000,
+        query_batch_size: int = 1024,
+        random_state: int = 42,
     ):
         if method not in ("tanimoto", "leverage"):
             raise ValueError("method must be 'tanimoto' or 'leverage'")
         self.method = method
         self.threshold = threshold
         self.k = k
+        self.max_train_reference = max_train_reference
+        self.query_batch_size = query_batch_size
+        self.random_state = random_state
+        self._rng = check_random_state(random_state)
 
         self._X_train: np.ndarray | None = None
         self._hat_threshold: float | None = None
@@ -96,6 +104,15 @@ class ApplicabilityDomain:
         """Memorise training data (tanimoto) or compute hat-matrix (leverage)."""
         self._X_train = X_train.copy()
         n, p = X_train.shape
+
+        if self.method == "tanimoto" and n > self.max_train_reference:
+            idx = self._rng.choice(n, size=self.max_train_reference, replace=False)
+            self._X_train = self._X_train[idx]
+            n = self._X_train.shape[0]
+            print(
+                f"  Large training set detected, using {n} reference compounds "
+                f"for AD (sampled from full set)."
+            )
 
         if self.method == "leverage":
             # hat threshold h* = 3(p+1)/n
@@ -122,26 +139,34 @@ class ApplicabilityDomain:
 
     # ------------------------------------------------------------------
     def _tanimoto_ad(self, X: np.ndarray) -> np.ndarray:
-        """Bit-vector Tanimoto similarity against training set."""
-        X_tr = self._X_train.astype(bool)  # type: ignore[union-attr]
-        X_q  = X.astype(bool)
+        """Bit-vector Tanimoto similarity against training set (batched + vectorised)."""
+        X_tr = (self._X_train > 0).astype(np.uint8)  # type: ignore[union-attr]
+        X_q = (X > 0).astype(np.uint8)
+
+        tr_pop = X_tr.sum(axis=1).astype(np.float32)
         inside = np.zeros(len(X_q), dtype=bool)
-        for i, q in enumerate(X_q):
-            # Jaccard / Tanimoto for bit vectors
-            inter = (X_tr & q).sum(axis=1)
-            union = (X_tr | q).sum(axis=1)
-            sim = np.where(union > 0, inter / union, 0.0)
-            top_k = np.sort(sim)[-self.k:]
-            inside[i] = top_k.mean() >= self.threshold
+        k_eff = min(self.k, len(X_tr))
+
+        for start in range(0, len(X_q), self.query_batch_size):
+            end = min(start + self.query_batch_size, len(X_q))
+            q_chunk = X_q[start:end]
+
+            # Vectorized intersection/union over the full reference panel
+            inter = (q_chunk @ X_tr.T).astype(np.float32)
+            q_pop = q_chunk.sum(axis=1).astype(np.float32)
+            union = q_pop[:, None] + tr_pop[None, :] - inter
+            sim = np.divide(inter, union, out=np.zeros_like(inter), where=union > 0)
+
+            # Top-k mean similarity without full sort
+            topk = np.partition(sim, -k_eff, axis=1)[:, -k_eff:]
+            inside[start:end] = topk.mean(axis=1) >= self.threshold
+
         return inside
 
     # ------------------------------------------------------------------
     def _leverage_ad(self, X: np.ndarray) -> np.ndarray:
         """Hat-matrix leverage for scaled descriptor vectors."""
-        h_vals = np.array([
-            float(x @ self._Xt_Xt_inv @ x)  # type: ignore[operator]
-            for x in X
-        ])
+        h_vals = np.einsum("ij,jk,ik->i", X, self._Xt_Xt_inv, X)  # type: ignore[arg-type]
         return h_vals <= self._hat_threshold  # type: ignore[operator]
 
     # ------------------------------------------------------------------

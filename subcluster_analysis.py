@@ -13,6 +13,29 @@ import os
 from datetime import datetime
 from sklearn.metrics import silhouette_score
 
+MAX_TSNE_POINTS = 10000
+MAX_MOLS_PER_IMAGE = 80
+
+
+def _save_molecule_grid_pages(mols, legends, output_base, mols_per_row=4, sub_img_size=(250, 250)):
+    """Save molecule grids in pages to avoid large-memory image rendering."""
+    if not mols:
+        return
+
+    total = len(mols)
+    pages = int(np.ceil(total / MAX_MOLS_PER_IMAGE))
+    for page in range(pages):
+        start = page * MAX_MOLS_PER_IMAGE
+        end = min((page + 1) * MAX_MOLS_PER_IMAGE, total)
+        img = Draw.MolsToGridImage(
+            mols[start:end],
+            molsPerRow=mols_per_row,
+            subImgSize=sub_img_size,
+            legends=legends[start:end],
+        )
+        page_suffix = f"_page_{page+1}" if pages > 1 else ""
+        img.save(f"{output_base}{page_suffix}.png")
+
 def determine_optimal_subclusters(clustered_data_file, target_cluster=1, max_clusters=10):
     """Determine optimal number of subclusters using multiple methods"""
     print(f"Loading clustered data from {clustered_data_file}")
@@ -95,10 +118,11 @@ def determine_optimal_subclusters(clustered_data_file, target_cluster=1, max_clu
     
     return recommended
 
-def subcluster_analysis(timestamp, target_cluster, n_subclusters):
+def subcluster_analysis(timestamp, target_cluster, n_subclusters, clustered_data_file=None):
     """Perform subclustering on a specific cluster and analyze chemical properties"""
-    # Define input path with timestamp
-    clustered_data_file = f"data/processed/{timestamp}/clusters/kit_fingerprints_clustered.csv"
+    # Define input path with timestamp (or use caller-provided clustered file)
+    if clustered_data_file is None:
+        clustered_data_file = f"data/processed/{timestamp}/clusters/kit_fingerprints_clustered.csv"
     
     if not os.path.exists(clustered_data_file):
         print(f"Error: Clustered data file not found at {clustered_data_file}")
@@ -180,16 +204,33 @@ def visualize_subclusters(cluster_df, fingerprint_cols, target_cluster, timestam
     pca = PCA(n_components=min(50, X_scaled.shape[1]))
     X_pca = pca.fit_transform(X_scaled)
     
-    # Then reduce to 2D with t-SNE
-    tsne = TSNE(n_components=2, random_state=42)
-    X_tsne = tsne.fit_transform(X_pca)
+    # Then reduce to 2D with t-SNE (sample for very large clusters)
+    if len(X_pca) > MAX_TSNE_POINTS:
+        rng = np.random.default_rng(42)
+        vis_idx = rng.choice(len(X_pca), size=MAX_TSNE_POINTS, replace=False)
+        print(f"t-SNE sampling enabled: {MAX_TSNE_POINTS}/{len(X_pca)} compounds")
+    else:
+        vis_idx = np.arange(len(X_pca))
+
+    X_pca_vis = X_pca[vis_idx]
+    perplexity = max(5, min(50, (len(X_pca_vis) - 1) // 3))
+    tsne = TSNE(
+        n_components=2,
+        random_state=42,
+        init='pca',
+        learning_rate='auto',
+        method='barnes_hut',
+        angle=0.5,
+        perplexity=perplexity,
+    )
+    X_tsne = tsne.fit_transform(X_pca_vis)
     
     # Create visualization dataframe
     vis_df = pd.DataFrame({
         'TSNE1': X_tsne[:, 0],
         'TSNE2': X_tsne[:, 1],
-        'subcluster': cluster_df['subcluster'],
-        'pIC50': cluster_df['pIC50']
+        'subcluster': cluster_df['subcluster'].iloc[vis_idx].values,
+        'pIC50': cluster_df['pIC50'].iloc[vis_idx].values
     })
     
     # Plot subclusters
@@ -206,16 +247,41 @@ def visualize_subclusters(cluster_df, fingerprint_cols, target_cluster, timestam
     plt.title(f'Subclusters within Cluster {target_cluster}')
     plt.legend(title='Subcluster')
     
-    # Plot 2: pIC50 values
-    plt.subplot(1, 2, 2)
-    scatter = sns.scatterplot(
-        x='TSNE1', y='TSNE2', 
-        hue='pIC50', 
-        palette='coolwarm',
-        data=vis_df
-    )
-    plt.title('pIC50 Distribution')
-    plt.colorbar(scatter.collections[0], label='pIC50')
+    # Plot 2: pIC50 values (safe when pIC50 is missing/NaN)
+    ax2 = plt.subplot(1, 2, 2)
+    pic50_vals = pd.to_numeric(vis_df['pIC50'], errors='coerce').to_numpy()
+    valid_mask = np.isfinite(pic50_vals)
+    if valid_mask.any():
+        sc = ax2.scatter(
+            vis_df.loc[valid_mask, 'TSNE1'],
+            vis_df.loc[valid_mask, 'TSNE2'],
+            c=pic50_vals[valid_mask],
+            cmap='coolwarm',
+            s=20,
+            alpha=0.8,
+            edgecolors='none',
+        )
+        ax2.set_title('pIC50 Distribution')
+        plt.colorbar(sc, ax=ax2, label='pIC50')
+    else:
+        sns.scatterplot(
+            x='TSNE1', y='TSNE2',
+            hue='subcluster',
+            palette='viridis',
+            data=vis_df,
+            ax=ax2,
+            legend=False,
+        )
+        ax2.set_title('pIC50 Distribution (unavailable)')
+        ax2.text(
+            0.5,
+            0.02,
+            'No valid pIC50 values found',
+            transform=ax2.transAxes,
+            ha='center',
+            va='bottom',
+            fontsize=9,
+        )
     
     plt.tight_layout()
     
@@ -251,8 +317,13 @@ def find_top_molecules(cluster_df, target_cluster, timestamp, top_n=20):
             legends.append(f"pIC50: {row['pIC50']:.2f} | SC: {row['subcluster']}")
     
     if mols:
-        img = Draw.MolsToGridImage(mols, molsPerRow=4, subImgSize=(250, 250), legends=legends)
-        img.save(f"{output_dir}/cluster_{target_cluster}_top_{top_n}.png")
+        _save_molecule_grid_pages(
+            mols,
+            legends,
+            f"{output_dir}/cluster_{target_cluster}_top_{top_n}",
+            mols_per_row=4,
+            sub_img_size=(250, 250),
+        )
     
     # Find top molecules by subcluster
     for subcluster_id in subclusters:
@@ -275,8 +346,13 @@ def find_top_molecules(cluster_df, target_cluster, timestamp, top_n=20):
                 legends.append(f"pIC50: {row['pIC50']:.2f}")
         
         if mols:
-            img = Draw.MolsToGridImage(mols, molsPerRow=4, subImgSize=(200, 200), legends=legends)
-            img.save(f"{output_dir}/cluster_{target_cluster}_subcluster_{subcluster_id}_top_{top_n}.png")
+            _save_molecule_grid_pages(
+                mols,
+                legends,
+                f"{output_dir}/cluster_{target_cluster}_subcluster_{subcluster_id}_top_{top_n}",
+                mols_per_row=4,
+                sub_img_size=(200, 200),
+            )
 
 def analyze_scaffolds(cluster_df, target_cluster, timestamp):
     """Extract and analyze common scaffolds in each subcluster"""
@@ -325,8 +401,13 @@ def analyze_scaffolds(cluster_df, target_cluster, timestamp):
                     })
         
         if mols:
-            img = Draw.MolsToGridImage(mols, molsPerRow=3, subImgSize=(250, 250), legends=legends)
-            img.save(f"{output_dir}/cluster_{target_cluster}_subcluster_{subcluster_id}_scaffolds.png")
+            _save_molecule_grid_pages(
+                mols,
+                legends,
+                f"{output_dir}/cluster_{target_cluster}_subcluster_{subcluster_id}_scaffolds",
+                mols_per_row=3,
+                sub_img_size=(250, 250),
+            )
     
     # Create a summary dataframe and save it
     scaffold_df = pd.DataFrame(scaffold_summary)
